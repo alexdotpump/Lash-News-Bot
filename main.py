@@ -25,6 +25,7 @@ GUILD_SEEN_ARTICLES_FILE = Path("seen_articles_by_guild.json")
 MAX_MARKET_LOOKUPS_PER_POLL = 20
 MAX_SAVED_ARTICLES = 500
 NEWS_QUERY_MAX_LENGTH = 500
+OWNER_ID = 1549940496607088670
 MARKET_MATCH_STOP_WORDS = frozenset(
     {
         "a", "about", "after", "against", "all", "an", "and", "any", "are",
@@ -51,6 +52,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("lash-news-bot")
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
 
 
 def load_seen_articles() -> list[str]:
@@ -421,6 +426,8 @@ class LashNewsBot(commands.Bot):
         self.tree.add_command(self.sources_slash)
         self.tree.add_command(self.keywords_slash)
         self.tree.add_command(self.help_slash)
+        self.tree.add_command(self.servers_slash)
+        self.tree.add_command(self.server_info_slash)
         self.news_task = asyncio.create_task(self.poll_news_forever())
 
     async def close(self) -> None:
@@ -759,6 +766,62 @@ class LashNewsBot(commands.Bot):
             "• `/keywords` — show terms derived from active markets.\n"
             "• `/help` — show this command list.\n"
             "• `!status` and `!test` — existing prefix commands."
+        )
+        await interaction.response.send_message(message, ephemeral=True)
+
+    @app_commands.command(
+        name="servers",
+        description="List all servers this bot is currently installed in (owner only).",
+    )
+    async def servers_slash(self, interaction: discord.Interaction) -> None:
+        if not is_owner(interaction.user.id):
+            await interaction.response.send_message(
+                "Only the bot owner can use this command.",
+                ephemeral=True,
+            )
+            return
+
+        if not self.guilds:
+            await interaction.response.send_message(
+                "This bot is not currently in any Discord servers.",
+                ephemeral=True,
+            )
+            return
+
+        guilds = sorted(self.guilds, key=lambda guild: guild.name.lower())
+        lines = [f"{guild.name} ({guild.id})" for guild in guilds]
+        content = "**Installed servers**\n" + "\n".join(lines[:20])
+        if len(lines) > 20:
+            content += f"\n... and {len(lines) - 20} more"
+        await interaction.response.send_message(content[:1800], ephemeral=True)
+
+    @app_commands.command(
+        name="server-info",
+        description="Show details about this server (owner only).",
+    )
+    async def server_info_slash(self, interaction: discord.Interaction) -> None:
+        if not is_owner(interaction.user.id):
+            await interaction.response.send_message(
+                "Only the bot owner can use this command.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Run this command inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        text_channels = sum(1 for channel in guild.channels if isinstance(channel, discord.TextChannel))
+        message = (
+            f"**Server:** {guild.name}\n"
+            f"**ID:** {guild.id}\n"
+            f"**Members:** {guild.member_count}\n"
+            f"**Text channels:** {text_channels}\n"
+            f"**Owner:** {guild.owner_id if guild.owner_id else 'unknown'}"
         )
         await interaction.response.send_message(message, ephemeral=True)
 
