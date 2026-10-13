@@ -10,3 +10,9 @@ __pycache__/
 venv/
 .venv/
 node_modules/
+
+# Not needed at runtime.
+tests/
+HANDOFF.md
+handoff.patch
+*.md

@@ -4,4 +4,10 @@ __pycache__/
 .DS_Store
 *.json
 venv/
+.venv/
 node_modules/
+tests/__pycache__/
+
+# Session working artifacts (not part of the project).
+HANDOFF.md
+handoff.patch
