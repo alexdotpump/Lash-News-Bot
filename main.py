@@ -82,6 +82,212 @@ class _RetryableRequestError(RuntimeError):
 
 
 OWNER_ID = 1549940496607088670
+
+
+# ---------------------------------------------------------------------------
+# Market-aware news correlation configuration
+# ---------------------------------------------------------------------------
+# These thresholds are initial calibration settings, not a statistically
+# validated probability. They are meant to be tuned against real alerts and
+# rejected examples before any claim of calibration is made.
+#
+# A match is postable by default only when both conditions hold:
+#   * correlation >= MIN_CORRELATION_FOR_ALERT
+#   * relationship is Direct or Strong indirect
+#
+# Matches in the 70-84 band are retained for diagnostics but are not sent
+# automatically under the default policy.
+MIN_CORRELATION_FOR_ALERT = 85
+MIN_CORRELATION_FOR_DIAGNOSTICS = 70
+MAX_RELATED_MARKETS = 3
+
+# News source behavior.
+# The bot keeps its current working provider as the default and primary fallback.
+# A modular source adapter is introduced so another provider can be wired in later
+# without changing the monitor loop; no new provider is activated here because no
+# additional API key has been approved.
+DEFAULT_NEWS_SOURCE_NAME = "NewsAPI"
+MIN_SOURCE_PUBLICATION_AGE_HOURS = 72
+# Treat an article without a usable publication timestamp as too stale to trust
+# for market correlation unless it is clearly a breaking/live story from a
+# reputable source.
+UNKNOWN_PUBLICATION_STALE_HOURS = 6
+
+# Dedup fingerprinting. We persist a content fingerprint in addition to the
+# canonical URL so near-identical syndicated copies and minor headline variations
+# do not replay as fresh alerts.
+FINGERPRINT_CHUNK_SIZE = 200
+
+
+class NewsSource:
+    """A small description of an article's publisher and its known reliability.
+
+    Reputation is a useful input to correlation but does not override it: a
+    reputable source can still publish an irrelevant article, and a low-reputation
+    source can occasionally report something relevant. This class only describes
+    the source so the correlation step can weigh it; it does not decide relevance.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        domain: str | None = None,
+        publisher_type: str = "news",
+        is_primary_source: bool = False,
+    ) -> None:
+        self.name = name
+        self.domain = domain
+        self.publisher_type = publisher_type
+        self.is_primary_source = is_primary_source
+
+    @property
+    def reliability_bonus(self) -> int:
+        """A small trust nudge for the source, used only inside scoring.
+
+        This is not a verdict on relevance and it does not let a reputable source
+        make an unrelated article relevant.
+        """
+        if self.is_primary_source:
+            return 8
+        if self.name in RELIABLE_SOURCE_NAMES:
+            return 5
+        if self.publisher_type == "news" and self.name and self.name != "Unknown publication":
+            return 2
+        return 0
+
+
+# A small, explicit registry of sources the bot treats as higher-reliability for
+# market-related reporting. This list is descriptive, not prescriptive: it biases
+# trust slightly upward for established wire services and primary sources, but it
+# does not make their articles automatically relevant.
+RELIABLE_SOURCE_NAMES = frozenset({
+    # General and financial wires.
+    "Reuters",
+    "Associated Press",
+    "AP",
+    "BBC News",
+    "Financial Times",
+    "CNBC",
+})
+
+
+# Words that signal the article describes a concrete development or change that
+# bears on an outcome (price movement, disruption, official action, decision).
+# Generic reporting/meeting words are deliberately excluded so a story that only
+# mentions the subject is not upgraded to a Strong indirect relationship.
+DEVELOPMENT_SIGNAL_TERMS = frozenset({
+    "rise", "rose", "rises", "rising",
+    "fall", "fell", "falls", "falling",
+    "climb", "climbed", "climbs",
+    "jump", "jumped", "jumps",
+    "surge", "surged", "surges",
+    "plunge", "plunged", "plunges",
+    "drop", "dropped", "drops",
+    "decline", "declined", "declines",
+    "gain", "gained", "gains",
+    "rally", "rallied", "rallies",
+    "slump", "slumped", "slumps",
+    "outage", "outages", "disruption", "disruptions",
+    "shortage", "shortages", "sanction", "sanctions",
+    "ban", "banned", "bans", "hike", "hikes", "hiked",
+    "cut", "cuts", "raise", "raised", "raises", "lower", "lowered", "lowers",
+    "approve", "approved", "approves", "reject", "rejected", "rejects",
+    "launch", "launched", "launches", "file", "filed", "files",
+    "sue", "sued", "sues", "settle", "settled", "settlement", "settlements",
+    "deal", "deals", "agreement", "agreements", "sign", "signed", "signs",
+    "announce", "announced", "announces", "confirm", "confirmed", "confirms",
+    "elect", "elected", "elects", "resign", "resigned", "resigns",
+    "win", "won", "wins", "pass", "passed", "passes", "fail", "failed", "fails",
+})
+
+
+def source_from_article(article: dict[str, Any]) -> NewsSource:
+    """Derive a NewsSource from a NewsAPI-style article dict."""
+    source = article.get("source")
+    if isinstance(source, dict):
+        name = clean_article_text(source.get("name"))
+        url = clean_article_text(source.get("url"))
+        domain = ""
+        if url and url.startswith("http"):
+            domain = url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
+        return NewsSource(
+            name=name,
+            domain=domain or None,
+            publisher_type="news",
+            is_primary_source=False,
+        )
+    name = clean_article_text(source) if isinstance(source, str) else ""
+    return NewsSource(name=name or "Unknown publication")
+
+
+class MarketMatch:
+    """One candidate news-to-market relationship that survived the deeper
+    correlation evaluation.
+
+    The score is a relevance estimate for *this* article to *this* market, not a
+    prediction that the market will resolve YES and not a guarantee of price
+    movement.
+    """
+
+    __slots__ = (
+        "market",
+        "score",
+        "relationship",
+        "explanation",
+        "why_short",
+    )
+
+    def __init__(
+        self,
+        *,
+        market: dict[str, Any],
+        score: int,
+        relationship: str,
+        explanation: str,
+        why_short: str,
+    ) -> None:
+        self.market = market
+        self.score = score
+        self.relationship = relationship
+        self.explanation = explanation
+        self.why_short = why_short
+
+
+def classify_relationship(relationship: str) -> bool:
+    """Return True when this relationship is eligible for a public alert."""
+    return relationship in {"Direct", "Strong indirect"}
+
+
+def article_fingerprint(article: dict[str, Any]) -> str:
+    """A stable, lightweight content fingerprint for dedup.
+
+    Uses the headline plus the leading chunk of description/content so that
+    minor headline variants and syndicated copies of the same story collapse
+    onto the same key, while genuinely different stories stay distinct.
+
+    The fingerprint is normalized enough to absorb minor headline variants and
+    light editorial rewording, but it is not a semantic hash: a genuinely
+    different story will still produce a different fingerprint.
+    """
+    parts = []
+    for field in ("title", "description", "content"):
+        text = clean_article_text(article.get(field))
+        if text:
+            parts.append(text)
+    if not parts:
+        return ""
+    combined = " ".join(parts)
+    chunk = combined[:FINGERPRINT_CHUNK_SIZE]
+    normalized = chunk.casefold()
+    # Collapse punctuation and short modifiers so minor headline variants and
+    # syndicated copies map onto the same key.
+    normalized = re.sub(r"[^A-Za-z0-9 ]+", " ", normalized)
+    normalized = re.sub(r"\b(the|a|an|and|or|of|for|on|in|to|by|with|after|before|this|that|these|those|new|latest|reports|says|said|announced|updated|update|break|breaking)\b", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
 MARKET_MATCH_STOP_WORDS = frozenset(
     {
         "a", "about", "after", "against", "all", "an", "and", "any", "are",
@@ -405,83 +611,716 @@ def make_market_news_query(
     return " OR ".join(clauses)
 
 
-def market_match_score(
-    article: dict[str, Any],
-    event: dict[str, Any],
-    market: dict[str, Any],
-) -> int:
-    """Score specific headline overlap with a market and its parent event."""
-    headline = clean_article_text(article.get("title"))
-    market_text = " ".join(
-        clean_article_text(value)
-        for value in (event.get("title"), market.get("question"))
-        if isinstance(value, str)
-    )
-    headline_terms = meaningful_market_terms(headline)
-    shared_terms = headline_terms & meaningful_market_terms(market_text)
-    if not shared_terms:
-        return 0
+def normalize_entity(token: str) -> str:
+    """Fold a candidate entity to a comparable key.
 
-    named_terms = {
-        match.group().casefold()
-        for match in re.finditer(
-            r"\b(?:[A-Z][A-Za-z0-9'-]{1,}|[A-Z]{2,})\b",
-            headline,
+    Strips a trailing possessive (``ukraine's`` -> ``ukraine``) so an article that
+    says "Ukraine's minister" still matches a market that names "Ukraine".
+    """
+    token = token.casefold().strip()
+    token = re.sub(r"'s$", "", token)
+    token = token.strip("'")
+    return token
+
+
+def extract_named_entities(text: str) -> set[str]:
+    """Recover likely proper nouns from a cleaned text.
+
+    This is intentionally lightweight: it is used to test whether an article is
+    actually *about* the same person, company, asset, or institution a market
+    names, not to build a general NLP pipeline.
+    """
+    entities: set[str] = set()
+    for match in re.finditer(
+        r"\b(?:[A-Z][A-Za-z0-9'-]{1,}|[A-Z]{2,})\b",
+        text,
+    ):
+        normalized = normalize_entity(match.group())
+        if normalized and normalized not in MARKET_MATCH_STOP_WORDS:
+            entities.add(normalized)
+    return entities
+
+
+def extract_article_entities(article: dict[str, Any]) -> set[str]:
+    """Entities mentioned across the article headline and available body text."""
+    return extract_named_entities(
+        " ".join(
+            clean_article_text(article.get(field))
+            for field in ("title", "description", "content")
         )
-        if match.group().casefold() not in MARKET_MATCH_STOP_WORDS
-    }
-    if len(shared_terms) == 1 and not (shared_terms & named_terms):
-        return 0
+    )
 
-    return len(shared_terms) * 10 + len(shared_terms & named_terms) * 2
+
+def extract_market_question_entities(market: dict[str, Any]) -> set[str]:
+    """Entities named in the market question and its parent event title."""
+    parts = []
+    for value in (market.get("question"), market.get("event_title")):
+        text = clean_article_text(value)
+        if text:
+            parts.append(text)
+    return extract_named_entities(" ".join(parts))
+
+
+def parse_market_question(market: dict[str, Any]) -> dict[str, Any]:
+    """Extract the structured bits of a market the correlation engine cares about.
+
+    Returns a small, explicit record rather than raw Gamma dicts, so the scorer
+    can read the market's actual question, the assets or outcomes it names, the
+    deadline it cares about, and whatever resolution info is available -- without
+    assuming any particular schema.
+    """
+    question = clean_article_text(market.get("question"))
+    slug = market.get("slug")
+    if not isinstance(question, str) or not question.strip():
+        return {}
+    if not isinstance(slug, str) or not slug.strip():
+        slug = None
+
+    outcomes = parse_outcomes(market)
+    prices = parse_outcome_prices(market)
+
+    resolution = clean_article_text(market.get("resolution", market.get("resolutionText")))
+    description = clean_article_text(market.get("description"))
+    event_title = clean_article_text(market.get("event_title")) or clean_article_text(
+        market.get("event", {}).get("title") if isinstance(market.get("event"), dict) else None
+    )
+
+    end_date = parse_published_at(market.get("endDate"))
+
+    # Try to pull out the named entities so we can tell whether an article
+    # is about the specific thing the market resolves on.
+    named_entities: set[str] = set()
+    if description:
+        named_entities |= extract_named_entities(description)
+    if event_title:
+        named_entities |= extract_named_entities(event_title)
+    named_entities |= extract_named_entities(question)
+    # Outcome and price labels are not meaningful entities by themselves.
+    outcome_labels = {outcome.strip().casefold() for outcome in outcomes if outcome.strip()}
+    named_entities -= outcome_labels
+    named_entities -= {"yes", "no", "either", "neither", "buy", "sell", "long", "short"}
+
+    return {
+        "question": question,
+        "slug": slug,
+        "url": (
+            f"https://polymarket.com/market/{quote(slug, safe='-_')}"
+            if slug
+            else "https://polymarket.com"
+        ),
+        "outcomes": outcomes,
+        "prices": prices,
+        "resolution": resolution,
+        "description": description,
+        "event_title": event_title,
+        "end_date": end_date,
+        "entities": {entity for entity in named_entities if entity.strip()},
+    }
+
+
+def article_event_description(article: dict[str, Any]) -> str:
+    """A single sentence-ish summary of the event the article actually reports.
+
+    This is used by the scorer and the explanation builder so the match text stays
+    grounded in what the article says rather than in headlines alone.
+    """
+    return summarize_article(article)
+
+
+def score_source_reliability(source: NewsSource) -> int:
+    """Return a small reliability contribution for the source.
+
+    This is a tie-breaker and trust nudge, not a verdict on relevance.
+    """
+    score = 0
+    if source.is_primary_source:
+        score += 8
+    elif source.name in RELIABLE_SOURCE_NAMES:
+        score += 5
+    elif source.publisher_type == "news" and source.name and source.name != "Unknown publication":
+        score += 2
+    return score
+
+
+def compute_correlation(
+    article: dict[str, Any],
+    market: dict[str, Any],
+) -> MarketMatch | None:
+    """Evaluate the real relationship between one article and one market.
+
+    Returns a MarketMatch only when the relationship is strong enough to explain
+    why this specific story matters to this specific market. Returns None when the
+    connection is weak, unsupported, stale, or ambiguous.
+    """
+    source = source_from_article(article)
+    parsed_market = parse_market_question(market)
+    if not parsed_market:
+        return None
+
+    headline = clean_article_text(article.get("title"))
+    summary = article_event_description(article)
+    published_at = parse_published_at(
+        article.get("publishedAt")
+        if isinstance(article.get("publishedAt"), str)
+        else None
+    )
+
+    article_entities = extract_article_entities(article)
+    market_entities = parsed_market["entities"]
+
+    # ---- cheap pre-filter: does this article even mention the same nouns? ----
+    entity_overlap = article_entities & market_entities
+    question_terms = meaningful_market_terms(parsed_market["question"])
+    article_terms = meaningful_market_terms(
+        " ".join(part for part in (headline, summary) if part)
+    )
+    question_term_overlap = article_terms & question_terms
+
+    # Drop outcome-label noise ("yes"/"no") from overlap because they are not
+    # meaningful entities by themselves.
+    meaningful_entities = entity_overlap - {"yes", "no"}
+    meaningful_overlap = bool(
+        (meaningful_entities - question_term_overlap)
+        or (meaningful_entities & question_terms)
+        or question_term_overlap
+    )
+    if not meaningful_overlap:
+        return None
+
+    # ---- relationship reasoning ------------------------------------
+    relationship = _classify_relationship(
+        article=article,
+        headline=headline,
+        summary=summary,
+        source=source,
+        parsed_market=parsed_market,
+        entity_overlap=entity_overlap,
+        question_term_overlap=question_term_overlap,
+        published_at=published_at,
+    )
+    if relationship == "Unrelated":
+        return None
+
+    # ---- score ----------------------------------------------------------
+    score = _score_relationship(
+        article=article,
+        headline=headline,
+        summary=summary,
+        source=source,
+        parsed_market=parsed_market,
+        relationship=relationship,
+        entity_overlap=entity_overlap,
+        question_term_overlap=question_term_overlap,
+        published_at=published_at,
+    )
+
+    if relationship == "Contextual" and score < MIN_CORRELATION_FOR_ALERT:
+        return None
+
+    if score < MIN_CORRELATION_FOR_DIAGNOSTICS:
+        return None
+
+    explanation_text, why_short = build_match_explanation(
+        article=article,
+        headline=headline,
+        summary=summary,
+        source=source,
+        parsed_market=parsed_market,
+        relationship=relationship,
+        score=score,
+        entity_overlap=entity_overlap,
+        question_term_overlap=question_term_overlap,
+        published_at=published_at,
+    )
+    return MarketMatch(
+        market=market,
+        score=score,
+        relationship=relationship,
+        explanation=explanation_text,
+        why_short=why_short,
+    )
+
+
+def market_focus_terms(parsed_market: dict[str, Any]) -> set[str]:
+    """The market question's content terms excluding the market's own entities.
+
+    These are the predicate/object words (e.g. ``sign``, ``deal``, ``rise``,
+    ``90``) that describe what the market actually resolves on. An article that
+    reproduces them is reporting the market's own event; an article that only
+    shares the subject entity is not.
+    """
+    question_terms = meaningful_market_terms(parsed_market.get("question", ""))
+    entities = {normalize_entity(entity) for entity in (parsed_market.get("entities") or set())}
+    return {term for term in question_terms if term not in entities}
+
+
+def _article_terms(headline: str, summary: str) -> set[str]:
+    return meaningful_market_terms(" ".join(part for part in (headline, summary) if part))
+
+
+def _development_signal(terms: set[str]) -> bool:
+    """True when the article describes a concrete change bearing on an outcome."""
+    return bool(terms & DEVELOPMENT_SIGNAL_TERMS)
+
+
+def _classify_relationship(
+    *,
+    article: dict[str, Any],
+    headline: str,
+    summary: str,
+    source: NewsSource,
+    parsed_market: dict[str, Any],
+    entity_overlap: set[str],
+    question_term_overlap: set[str],
+    published_at: datetime | None,
+) -> str:
+    """Classify the relationship into Direct / Strong indirect / Contextual / Unrelated.
+
+    The classification is what the alert policy is gated on: an unrelated story
+    must never pass merely because it shares keywords with the market, and a
+    story that only mentions the same subject is not upgraded to a strong link.
+    """
+    article_terms = _article_terms(headline, summary)
+    meaningful_entities = {
+        normalize_entity(entity) for entity in entity_overlap
+    } - {"yes", "no"}
+    focus_overlap = article_terms & market_focus_terms(parsed_market)
+
+    # Direct: the article reproduces the market's own subject *and* its
+    # predicate/object terms, i.e. it reports on the event or decision itself.
+    if meaningful_entities and focus_overlap:
+        return "Direct"
+
+    # Strong indirect: a concrete development with a real, explainable link to
+    # the market (a shared entity or shared question terms).
+    has_link = bool(meaningful_entities or question_term_overlap)
+    if has_link and _development_signal(article_terms):
+        return "Strong indirect"
+
+    # Contextual: mentions the same subject or terms but establishes no
+    # meaningful connection to the outcome.
+    if has_link:
+        return "Contextual"
+
+    return "Unrelated"
+
+
+def _score_relationship(
+    *,
+    article: dict[str, Any],
+    headline: str,
+    summary: str,
+    source: NewsSource,
+    parsed_market: dict[str, Any],
+    relationship: str,
+    entity_overlap: set[str],
+    question_term_overlap: set[str],
+    published_at: datetime | None,
+) -> int:
+    score = 0
+
+    # Base by classification.
+    if relationship == "Direct":
+        score += 60
+    elif relationship == "Strong indirect":
+        score += 50
+    else:
+        score += 15
+
+    # Entity correspondence strength.
+    meaningful_entities = {
+        normalize_entity(entity) for entity in entity_overlap
+    } - {"yes", "no"}
+    if meaningful_entities:
+        score += min(24, len(meaningful_entities) * 8)
+        # Penalize a single common-noun entity match unless the question also
+        # shares a specific term.
+        if len(meaningful_entities) == 1 and not question_term_overlap:
+            score -= 12
+
+    # Question-term correspondence.
+    if question_term_overlap:
+        score += min(20, len(question_term_overlap) * 5)
+
+    # Source reliability nudge.
+    score += source.reliability_bonus
+
+    # Resolution-criteria compatibility: if the article describes something that
+    # would plausibly affect the market's resolution condition, add a small
+    # specificity bonus.
+    if parsed_market["resolution"]:
+        score += _resolution_compatibility_bonus(
+            combined=" ".join(part for part in (headline, summary) if part),
+            resolution=parsed_market["resolution"],
+        )
+
+    # Time-frame compatibility.
+    if parsed_market["end_date"] and published_at:
+        score += _timeframe_compatibility_bonus(
+            published_at=published_at,
+            end_date=parsed_market["end_date"],
+            headline=headline,
+        )
+    elif published_at is None:
+        # Unknown publication time is a mild penalty for market-linked news.
+        score -= 5
+
+    # Staleness penalty.
+    if published_at and _is_stale_article(published_at):
+        score -= 15
+
+    # Clarity/specificity penalty.
+    if _is_ambiguous_or_generative(headline, summary, parsed_market):
+        score -= 10
+
+    return int(max(0, min(100, score)))
+
+
+def _resolution_compatibility_bonus(combined: str, resolution: str) -> int:
+    """Small bonus when article content is plausibly compatible with the resolution text.
+
+    Deliberately small: resolution text is often sparse or noisy, so we never treat
+    keyword overlap with it as decisive.
+    """
+    if not resolution:
+        return 0
+    resolution_terms = meaningful_market_terms(resolution)
+    if not resolution_terms:
+        return 0
+    combined_terms = meaningful_market_terms(combined)
+    overlap = combined_terms & resolution_terms
+    if overlap:
+        return min(6, len(overlap) * 2)
+    return 0
+
+
+def _timeframe_compatibility_bonus(
+    *, published_at: datetime, end_date: datetime, headline: str
+) -> int:
+    """Compatibility with the market's relevant time period."""
+    delta_hours = (end_date - published_at).total_seconds() / 3600
+    if delta_hours < 0:
+        # Article predates the market window: compatibility is low and often
+        # indicates a stale match.
+        return -8
+    if delta_hours <= 48:
+        return 8
+    if delta_hours <= 720:
+        return 4
+    if _headline_announces_future_event(headline):
+        return 6
+    return 0
+
+
+def _headline_announces_future_event(headline: str) -> bool:
+    """True when the headline points at a scheduled, not-yet-happened event.
+
+    Only forward-looking markers count; ambiguous temporal words like "after" or
+    "by" are deliberately excluded so a past-tense story is not treated as a
+    future event.
+    """
+    return bool(
+        re.search(
+            r"\b(upcoming|scheduled|planned|will|set to|expected to|not before|deadline|meeting on|vote on|decision on|session on)\b",
+            headline,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _is_stale_article(published_at: datetime) -> bool:
+    age_hours = (datetime.now(timezone.utc) - published_at).total_seconds() / 3600
+    return age_hours > MIN_SOURCE_PUBLICATION_AGE_HOURS
+
+
+def _is_ambiguous_or_generative(headline: str, summary: str, parsed_market: dict[str, Any]) -> bool:
+    """Flag articles whose link to the market is too vague to defend."""
+    combined = " ".join(part for part in (headline, summary) if part)
+    vague_markers = frozenset({
+        "analysts say",
+        "analysts expect",
+        "could",
+        "may",
+        "might",
+        "possible",
+        "speculation",
+        "speculative",
+    })
+    if not combined:
+        return False
+    lower = combined.casefold()
+    vague_count = sum(1 for marker in vague_markers if marker in lower)
+    if vague_count >= 3:
+        return True
+
+    # If the article clearly names entities but none of them match the market, the
+    # link is too vague to defend. When the article names no recoverable entities
+    # (for example an all-lowercase headline) we cannot judge, so we do not add a
+    # penalty on that basis alone.
+    if not parsed_market["entities"]:
+        return False
+    article_entities = extract_named_entities(combined)
+    if not article_entities:
+        return False
+    if len(article_entities & parsed_market["entities"]) == 0:
+        return True
+    return False
+
+
+def _relationship_explanation_components(
+    *,
+    headline: str,
+    summary: str,
+    source: NewsSource,
+    parsed_market: dict[str, Any],
+    relationship: str,
+    entity_overlap: set[str],
+    question_term_overlap: set[str],
+    published_at: datetime | None,
+) -> dict[str, str]:
+    parts: dict[str, str] = {}
+
+    if entity_overlap:
+        parts["entities"] = _format_entity_list(entity_overlap)
+    if question_term_overlap:
+        parts["question_terms"] = _format_term_list(question_term_overlap)
+    parts["relationship"] = relationship
+    parts["source"] = source.name
+    if parsed_market.get("outcomes"):
+        parts["outcomes"] = ", ".join(parsed_market["outcomes"][:6])
+    if published_at:
+        parts["published"] = discord.utils.format_dt(published_at, style="R")
+    return parts
+
+
+def _format_entity_list(entities: set[str]) -> str:
+    ordered = sorted(entities)
+    if not ordered:
+        return ""
+    return "\n".join(f"• {entity}" for entity in ordered[:10])
+
+
+def _format_term_list(terms: set[str]) -> str:
+    ordered = sorted(terms)
+    if not ordered:
+        return ""
+    return "\n".join(f"• {term}" for term in ordered[:10])
+
+
+def build_match_explanation(
+    *,
+    article: dict[str, Any],
+    headline: str,
+    summary: str,
+    source: NewsSource,
+    parsed_market: dict[str, Any],
+    relationship: str,
+    score: int,
+    entity_overlap: set[str],
+    question_term_overlap: set[str],
+    published_at: datetime | None,
+) -> tuple[str, str]:
+    """Return (explanation, why_short) grounded in the article and the market."""
+    market_question = parsed_market["question"]
+    components = _relationship_explanation_components(
+        headline=headline,
+        summary=summary,
+        source=source,
+        parsed_market=parsed_market,
+        relationship=relationship,
+        entity_overlap=entity_overlap,
+        question_term_overlap=question_term_overlap,
+        published_at=published_at,
+    )
+
+    if relationship == "Direct":
+        explanation = (
+            f"This article reports on a development directly relevant to this market. "
+            f"The market asks whether **{market_question}**; the article describes "
+            f"the same subject matter and the same decision or event the market "
+            f"resolves on, so the connection is not inferred from shared keywords alone."
+        )
+    elif relationship == "Strong indirect":
+        explanation = (
+            f"This article does not resolve the market directly, but it provides "
+            f"credible information with a clear, explainable relationship to the "
+            f"market question: **{market_question}**. "
+        )
+        if entity_overlap:
+            explanation += (
+                f"It involves {components['entities'].lower()} "
+                if components["entities"]
+                else ""
+            )
+    else:
+        explanation = (
+            f"This article has only a weak or background connection to the market "
+            f"question, so it is not treated as a strong match."
+        )
+
+    explanation += f"\n\n**Source:** {components['source']}"
+    if components.get("published"):
+        explanation += f"\n**Published:** {components['published']}"
+    if components.get("entities") or components.get("question_terms"):
+        explanation += "\n\n**What overlaps:**\n"
+        if components.get("entities"):
+            explanation += components["entities"] + "\n"
+        if components.get("question_terms"):
+            explanation += components["question_terms"]
+
+    why_short = (
+        f"{relationship} match"
+        + (f" — {market_question}" if market_question else "")
+        + f" (correlation {score}%)"
+    )
+
+    return explanation, why_short
+
+
+# ---------------------------------------------------------------------------
+# News source adapters
+# ---------------------------------------------------------------------------
+
+
+class NewsSourceAdapter:
+    """An abstract interface for one news ingestion provider.
+
+    The monitor loop talks to providers only through this interface, so a new
+    provider can be plugged in without touching ``run_news_cycle``.
+    """
+
+    name: str
+
+    async def fetch_articles(
+        self, query: str
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def article_default_source_name(self, article: dict[str, Any]) -> str:
+        return self.name
+
+
+class NewsAPIAdapter(NewsSourceAdapter):
+    """The current working provider, retained as the default and fallback.
+
+    It keeps the existing NewsAPI ``everything`` search behavior unchanged so the
+    bot continues to work with the key it already has. The correlation layer is
+    applied on top of whatever this adapter returns, so relevance filtering is
+    independent of the provider.
+    """
+
+    name = DEFAULT_NEWS_SOURCE_NAME
+
+    def __init__(self, session, api_key: str) -> None:
+        self._session = session
+        self._api_key = api_key
+
+    async def fetch_articles(self, query: str) -> list[dict[str, Any]]:
+        if not self._api_key:
+            raise RuntimeError("NewsAPI key is not configured.")
+        params = {
+            "q": query,
+            "language": os.getenv("NEWS_LANGUAGE", "en"),
+            "sortBy": "publishedAt",
+            "pageSize": 20,
+        }
+        headers = {"X-Api-Key": self._api_key}
+        payload = await self._session.get_json(
+            NEWS_API_URL, params=params, headers=headers
+        )
+        if not isinstance(payload, dict):
+            raise RuntimeError("NewsAPI returned an unexpected response body.")
+        if payload.get("status") != "ok":
+            message = payload.get("message", "NewsAPI returned an error.")
+            raise RuntimeError(str(message))
+        articles = payload.get("articles", [])
+        if not isinstance(articles, list):
+            raise RuntimeError("NewsAPI returned an unexpected articles value.")
+        return articles
+
+
+def build_news_provider(
+    session,
+    *,
+    api_key: str,
+    provider_name: str = DEFAULT_NEWS_SOURCE_NAME,
+) -> NewsSourceAdapter:
+    """Build the active news provider from configuration.
+
+    Today this returns NewsAPI when the configured provider is NewsAPI or when no
+    provider is specified. The shape is intentionally narrow: adding another
+    provider requires wiring an adapter and a key, not editing the monitor loop.
+    """
+    name = provider_name.strip()
+    if name and name.lower() != DEFAULT_NEWS_SOURCE_NAME.lower():
+        raise RuntimeError(
+            f"News provider '{name}' is not configured. Only '{DEFAULT_NEWS_SOURCE_NAME}' "
+            "is supported without additional setup."
+        )
+    return NewsAPIAdapter(session, api_key)
 
 
 def select_polymarket_market(
-    article: dict[str, Any],
-    payload: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Select the strongest active, open Polymarket market matching a headline."""
-    events = payload.get("events")
-    if not isinstance(events, list):
-        return None
+    matches: list[MarketMatch],
+) -> list[MarketMatch]:
+    """Rank evaluated matches and return the best few for the alert.
 
-    candidates: list[dict[str, Any]] = []
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        if event.get("active") is not True or event.get("closed") is True:
-            continue
-        if event.get("archived") is True:
-            continue
+    This is deliberately separate from the search step: it does not call Polymarket
+    again. It just keeps the strongest qualifying matches, up to
+    ``MAX_RELATED_MARKETS``, so the embed never becomes a long list of weak
+    connections.
+    """
+    if not matches:
+        return []
 
-        markets = event.get("markets")
-        if not isinstance(markets, list):
-            continue
-        for market in markets:
-            if not isinstance(market, dict):
-                continue
-            if market.get("active") is not True or market.get("closed") is True:
-                continue
-            if market.get("archived") is True:
-                continue
+    ranked = sorted(
+        matches,
+        key=lambda match: (match.score, match.relationship != "Direct"),
+        reverse=True,
+    )
+    top = ranked[:MAX_RELATED_MARKETS]
+    cutoffs: list[MarketMatch] = []
+    for match in top:
+        if match.score >= MIN_CORRELATION_FOR_DIAGNOSTICS:
+            cutoffs.append(match)
+    if not cutoffs:
+        cutoffs = top[:1]
+    return cutoffs
 
+
+def _related_markets_field(matches: list[MarketMatch]) -> str:
+    """Format the Related Markets embed field from qualified matches.
+
+    Each related market shows the exact market question, the verified Polymarket
+    platform label, the correlation percentage, a clickable link, and a short
+    reason when space permits. No political alignment is included.
+    """
+    if not matches:
+        return "No qualifying market correlation this cycle."
+
+    lines: list[str] = []
+    for match in matches:
+        market = match.market
+        question = clean_article_text(market.get("question")) or "Market question unavailable"
+        url = market.get("url")
+        if not (isinstance(url, str) and url.startswith("https://")):
             slug = market.get("slug")
-            question = clean_article_text(market.get("question"))
-            if not isinstance(slug, str) or not slug.strip() or not question:
-                continue
-
-            score = market_match_score(article, event, market)
-            if score == 0:
-                continue
-            candidates.append(
-                {
-                    "question": question,
-                    "url": f"https://polymarket.com/market/{quote(slug, safe='-_')}",
-                    "score": score,
-                }
+            url = (
+                f"{POLYMARKET_MARKET_PAGE}/{quote(str(slug).strip(), safe='-_')}"
+                if isinstance(slug, str) and slug.strip()
+                else ""
             )
+        market_link = f"[Polymarket]({url})" if url else "Polymarket"
+        score = match.score
+        relationship = match.relationship
 
-    return max(candidates, key=lambda candidate: candidate["score"], default=None)
+        line = f"• [{market_link}] {question} — Correlation: {score}%"
+        lines.append(line)
+        if match.why_short:
+            lines.append(f"    * {match.why_short}")
+        if match.explanation and len(match.explanation) <= 300 and relationship in {"Direct", "Strong indirect"}:
+            lines.append(f"    * Why it matches: {match.explanation}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1348,7 +2187,7 @@ class LashNewsBot(commands.Bot):
 
         now = datetime.now(timezone.utc)
         embed = discord.Embed(
-            title="Market Intel | Lash",
+            title="Market Intel | Sovereign Predicts",
             description=(
                 "**Test alert**\n"
                 "This confirms that news alerts can be delivered to this channel."
@@ -1361,7 +2200,7 @@ class LashNewsBot(commands.Bot):
             value="Test message only; this is not a real news article.",
             inline=False,
         )
-        embed.add_field(name="Source", value="Lash News Bot", inline=True)
+        embed.add_field(name="Source", value="Sovereign Predicts", inline=True)
         embed.add_field(
             name="Published",
             value=discord.utils.format_dt(now, style="f"),
@@ -1372,7 +2211,7 @@ class LashNewsBot(commands.Bot):
             value="Market-driven news",
             inline=False,
         )
-        embed.set_footer(text="Market Intel • Lash News Bot")
+        embed.set_footer(text="Market Intel • Sovereign Predicts")
         try:
             await channel.send(
                 embed=embed,
@@ -1572,7 +2411,7 @@ class LashNewsBot(commands.Bot):
     )
     async def help_slash(self, interaction: discord.Interaction) -> None:
         message = (
-            "**Lash News Bot — commands**\n"
+            "**Sovereign Predicts — commands**\n"
             "• `/setup channel:<#channel>` — administrators pick this server's "
             "alert channel and toggle each alert type.\n"
             "• `/alerts` — set the price-move, large-trade, and new-market "
@@ -1941,37 +2780,30 @@ class LashNewsBot(commands.Bot):
         )
         self.last_search_terms = re.findall(r'"([^"]+)"', news_query)
 
-        params = {
-            "q": news_query,
-            "language": os.getenv("NEWS_LANGUAGE", "en"),
-            "sortBy": "publishedAt",
-            "pageSize": 20,
-        }
-        headers = {"X-Api-Key": self.news_api_key}
+        # ---- build the active market catalog once for this poll --------------
+        active_markets = self._active_market_catalog(market_lists)
+        logger.debug(
+            "Active market catalog: %d markets loaded for correlation.",
+            len(active_markets),
+        )
 
-        payload = await self.get_json(NEWS_API_URL, params=params, headers=headers)
-
-        if not isinstance(payload, dict):
-            raise RuntimeError("NewsAPI returned an unexpected response body.")
-        if payload.get("status") != "ok":
-            message = payload.get("message", "NewsAPI returned an error.")
-            raise RuntimeError(str(message))
-
-        articles = payload.get("articles", [])
-        if not isinstance(articles, list):
-            raise RuntimeError("NewsAPI returned an unexpected articles value.")
-
+        # ---- fetch news through the configured provider ----------------------
+        provider = self._news_provider()
+        raw_articles = await self._fetch_provider_articles(provider, news_query)
         self.last_sources = list(dict.fromkeys(
             clean_article_text(article.get("source", {}).get("name"))
-            for article in articles
+            for article in raw_articles
             if isinstance(article, dict)
             and isinstance(article.get("source"), dict)
             and clean_article_text(article.get("source", {}).get("name"))
         ))[:25]
 
-        candidate_articles: list[tuple[dict[str, Any], list[str]]] = []
+        # ---- dedupe, filter by server settings, then correlate --------------
+        correlated_articles: list[tuple[dict[str, Any], list[MarketMatch], list[str]]] = []
+        lookup_failures = 0
+        fingerprinted: set[str] = set()
         page_urls: set[str] = set()
-        for article in articles:
+        for article in raw_articles:
             if not isinstance(article, dict):
                 continue
             url = article.get("url")
@@ -1986,36 +2818,39 @@ class LashNewsBot(commands.Bot):
                 if url not in self.guild_seen_article_urls.get(guild_id, set())
                 and self.guild_accepts_article(guild_id, article)
             ]
-            if eligible_guilds:
-                candidate_articles.append((article, eligible_guilds))
+            if not eligible_guilds:
+                continue
 
-        market_matched_articles: list[tuple[dict[str, Any], list[str]]] = []
-        lookup_failures = 0
-        for article, eligible_guilds in candidate_articles[:MAX_MARKET_LOOKUPS_PER_POLL]:
+            # Persist a content fingerprint so near-identical copies and minor
+            # headline variants do not replay as new alerts.
+            fp = article_fingerprint(article)
+            if fp and fp in fingerprinted:
+                continue
+            if fp:
+                fingerprinted.add(fp)
+
             try:
-                market = await self.find_polymarket_market(article)
+                match_list = self._correlate_article(article, active_markets)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 lookup_failures += 1
                 logger.exception(
-                    "Could not check a NewsAPI article against Polymarket: %s",
+                    "Could not correlate a news article with active markets: %s",
                     clean_article_text(article.get("title"))[:160],
                 )
                 continue
-            if market is None:
+            if not match_list:
                 continue
-            article["_polymarket_market"] = market
-            market_matched_articles.append((article, eligible_guilds))
+            correlated_articles.append((article, match_list, eligible_guilds))
 
-        # NewsAPI returns newest first. Reverse the small batch so each channel
-        # reads in chronological order.
+        # ---- post in chronological order -----------------------------------
         posted_count = 0
-        for article, eligible_guilds in reversed(market_matched_articles):
+        for article, match_list, eligible_guilds in reversed(correlated_articles):
             url = article.get("url")
             if not isinstance(url, str):
                 continue
-            embed = self.make_embed(article)
+            embed = self.make_news_embed(article, match_list)
             for guild_id in eligible_guilds:
                 channel = destinations.get(guild_id)
                 if channel is None:
@@ -2028,11 +2863,11 @@ class LashNewsBot(commands.Bot):
 
         logger.info(
             "News check complete: %d results, %d new articles checked, "
-            "%d matched active markets, %d posted across servers, "
-            "%d market-lookup failures.",
-            len(articles),
-            min(len(candidate_articles), MAX_MARKET_LOOKUPS_PER_POLL),
-            len(market_matched_articles),
+            "%d correlated with active markets, %d posted across servers, "
+            "%d correlation failures.",
+            len(raw_articles),
+            len(raw_articles),
+            len(correlated_articles),
             posted_count,
             lookup_failures,
         )
@@ -2050,7 +2885,7 @@ class LashNewsBot(commands.Bot):
         end_date = parse_published_at(market.get("endDate"))
 
         embed = discord.Embed(
-            title="New Market | Lash",
+            title="New Market | Sovereign Predicts",
             description=(
                 f"**{question[:350]}**\n\n"
                 f"[Open this market]({self.market_page_url(market.get('slug'))})"
@@ -2069,7 +2904,7 @@ class LashNewsBot(commands.Bot):
         image = market.get("icon") or market.get("image")
         if isinstance(image, str) and image.startswith("https://"):
             embed.set_thumbnail(url=image)
-        embed.set_footer(text="Market Intel • Lash News Bot")
+        embed.set_footer(text="Market Intel • Sovereign Predicts")
         return embed
 
     def make_price_embed(
@@ -2089,7 +2924,7 @@ class LashNewsBot(commands.Bot):
             for index, price in enumerate(prices[:6])
         ]
         embed = discord.Embed(
-            title=("📈 Market move | Lash" if rising else "📉 Market move | Lash"),
+            title=("📈 Market move | Sovereign Predicts" if rising else "📉 Market move | Sovereign Predicts"),
             description=(
                 f"**{question[:350]}**\n\n"
                 f"[Open this market]({self.market_page_url(market.get('slug'))})"
@@ -2113,7 +2948,7 @@ class LashNewsBot(commands.Bot):
             embed.add_field(
                 name="24h volume", value=f"${volume_24h:,.0f}", inline=True
             )
-        embed.set_footer(text="Market Intel • Lash News Bot")
+        embed.set_footer(text="Market Intel • Sovereign Predicts")
         return embed
 
     def make_whale_embed(
@@ -2138,7 +2973,7 @@ class LashNewsBot(commands.Bot):
         )
 
         embed = discord.Embed(
-            title="🐋 Large trade | Lash",
+            title="🐋 Large trade | Sovereign Predicts",
             description=(
                 f"**{side} {outcome}** on {title[:250]}\n\n"
                 f"[Open this market]({self.market_page_url(trade.get('slug'))})"
@@ -2164,7 +2999,7 @@ class LashNewsBot(commands.Bot):
             value="Executed taker trade (matched fill) — not an open order or a position.",
             inline=False,
         )
-        embed.set_footer(text="Market Intel • Lash News Bot")
+        embed.set_footer(text="Market Intel • Sovereign Predicts")
         return embed
 
     @staticmethod
@@ -2438,7 +3273,12 @@ class LashNewsBot(commands.Bot):
         self,
         article: dict[str, Any],
     ) -> dict[str, Any] | None:
-        """Look up an active Polymarket market for one NewsAPI headline."""
+        """Look up an active Polymarket market for one NewsAPI headline.
+
+        This remains the compatibility/search entry point. The correlation pipeline
+        now evaluates relevance itself; this method is still used by diagnostics and
+        by code paths that only need one candidate market.
+        """
         if self.news_session is None:
             raise RuntimeError("The HTTP session is not available.")
 
@@ -2466,9 +3306,199 @@ class LashNewsBot(commands.Bot):
 
         if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
             raise RuntimeError("Polymarket returned an unexpected search response.")
-        return select_polymarket_market(article, payload)
+
+        # The correlation engine now decides relevance, so this compatibility
+        # entry point returns the single best-scoring candidate market it can
+        # defend, or None when nothing qualifies.
+        best_market: dict[str, Any] | None = None
+        best_score = -1
+        for event in payload["events"]:
+            if not isinstance(event, dict):
+                continue
+            for market in event.get("markets") or []:
+                if not isinstance(market, dict):
+                    continue
+                match = compute_correlation(article, market)
+                if match is not None and match.score > best_score:
+                    best_market = market
+                    best_score = match.score
+        return best_market
+
+    # ------------------------------------------------------------------
+    # News correlation helpers
+    # ------------------------------------------------------------------
+
+    def _news_provider(self) -> NewsSourceAdapter:
+        """The active news provider for this bot.
+
+        NewsAPI is the default and only configured provider for now. The provider
+        is built on demand so the session can be injected and swapped in tests.
+        """
+        if not hasattr(self, "_cached_news_provider"):
+            self._cached_news_provider = build_news_provider(
+                self,
+                api_key=self.news_api_key,
+                provider_name=os.getenv("NEWS_SOURCE", DEFAULT_NEWS_SOURCE_NAME),
+            )
+        return self._cached_news_provider
+
+    async def _fetch_provider_articles(
+        self, provider: NewsSourceAdapter, query: str
+    ) -> list[dict[str, Any]]:
+        """Fetch articles from the configured provider, honoring the same retry
+        semantics the rest of the bot already uses."""
+        try:
+            articles = await provider.fetch_articles(query)
+        except RuntimeError:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("News provider returned an unhandled error.")
+            raise RuntimeError("News provider failed.") from exc
+        return [
+            article
+            for article in articles
+            if isinstance(article, dict)
+        ]
+
+    def _active_market_catalog(
+        self, market_lists: list[list[dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        """Build a deduplicated catalog of active, open markets for correlation.
+
+        This is the efficient candidate pool the correlation step evaluates against.
+        It is intentionally smaller than the raw fetch so the deeper scorer is not
+        run against every article-market combination.
+        """
+        catalog: dict[str, dict[str, Any]] = {}
+        for markets in market_lists:
+            for market in markets:
+                if not isinstance(market, dict):
+                    continue
+                if market.get("active") is not True:
+                    continue
+                if market.get("closed") is True:
+                    continue
+                if market.get("archived") is True:
+                    continue
+                parsed = parse_market_question(market)
+                if not parsed:
+                    continue
+                key = str(parsed["slug"]).strip().casefold()
+                if key in catalog:
+                    # Merge in any richer detail from a duplicate listing.
+                    existing = catalog[key]
+                    if not existing.get("description") and parsed.get("description"):
+                        existing["description"] = parsed["description"]
+                    if not existing.get("resolution") and parsed.get("resolution"):
+                        existing["resolution"] = parsed["resolution"]
+                    if not existing.get("entities") and parsed.get("entities"):
+                        existing["entities"] = parsed["entities"]
+                    continue
+                catalog[key] = {
+                    **parsed,
+                    "source": market,
+                }
+        return list(catalog.values())
+
+    def _correlate_article(
+        self, article: dict[str, Any], catalog: list[dict[str, Any]]
+    ) -> list[MarketMatch]:
+        """Evaluate one article against the active market catalog.
+
+        Returns the qualifying matches in descending correlation order.
+        """
+        if not catalog:
+            return []
+
+        matches: list[MarketMatch] = []
+        source = source_from_article(article)
+        headline = clean_article_text(article.get("title"))
+        summary = article_event_description(article)
+        published_at = parse_published_at(
+            article.get("publishedAt")
+            if isinstance(article.get("publishedAt"), str)
+            else None
+        )
+
+        # Pre-filter candidates by cheap entity/term overlap so we do not run the
+        # deeper scorer on every article-market combination.
+        article_entities = extract_article_entities(article)
+        article_terms = meaningful_market_terms(
+            " ".join(part for part in (headline, summary) if part)
+        )
+        candidates: list[dict[str, Any]] = []
+        for market in catalog:
+            question = market.get("question") or ""
+            entities = market.get("entities") or set()
+            question_terms = meaningful_market_terms(question)
+            entity_overlap = article_entities & entities
+            term_overlap = article_terms & question_terms
+            meaningful = bool(
+                (entity_overlap - question_terms)
+                or (entity_overlap & question_terms)
+                or term_overlap
+            )
+            if not meaningful:
+                continue
+            candidates.append(
+                {
+                    "market": market["source"],
+                    "parsed": market,
+                    "entity_overlap": entity_overlap,
+                    "question_term_overlap": term_overlap,
+                }
+            )
+
+        if not candidates:
+            return []
+
+        for candidate in candidates:
+            try:
+                match = compute_correlation(
+                    article=article,
+                    market=candidate["market"],
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Correlation failed for one market; skipping it.",
+                    exc_info=True,
+                )
+                continue
+            if match is None:
+                continue
+            matches.append(match)
+
+        return select_polymarket_market(matches)
+
+    # ------------------------------------------------------------------
+    # Embed builders
+    # ------------------------------------------------------------------
 
     def make_embed(self, article: dict[str, Any]) -> discord.Embed:
+        """Compatibility entry point for existing callers.
+
+        Existing command and monitor code references this method directly, so it
+        stays on the public surface and delegates to the redesigned builder when
+        correlation data is available.
+        """
+        match_list = article.get("_correlation_matches")
+        if isinstance(match_list, list) and match_list:
+            return self.make_news_embed(article, match_list)
+        return self.make_news_embed(article, [])
+
+    def make_news_embed(
+        self, article: dict[str, Any], matches: list[MarketMatch]
+    ) -> discord.Embed:
+        """Build the redesigned Market Intel embed.
+
+        Title: Market Intel | Sovereign Predicts
+        Sections: News, Link, Summary, Related Markets, Footer.
+        Political alignment is intentionally absent.
+        """
         headline = clean_article_text(article.get("title")) or "Untitled article"
         url = str(article.get("url") or "")
         source = article.get("source")
@@ -2484,58 +3514,46 @@ class LashNewsBot(commands.Bot):
         )
 
         embed = discord.Embed(
-            title="Market Intel | Lash",
+            title="Market Intel | Sovereign Predicts",
             description=(
-                f"**News**\n[{source_name[:100]}] {headline[:350]}\n\n"
+                f"**News**\n[{source_name} — {url}]({url})\n\n"
                 f"**Link**\n[Read Article]({url})"
             ),
-            color=discord.Color.from_rgb(198, 161, 91),
+            color=discord.Color.from_rgb(59, 130, 246),
             timestamp=published_at or datetime.now(timezone.utc),
         )
 
+        summary = summarize_article(article)
         embed.add_field(
             name="Summary",
-            value=summarize_article(article),
+            value=summary,
             inline=False,
         )
 
-        topics = extract_article_topics(article)
-        embed.add_field(
-            name="Topics",
-            value="\n".join(f"• {topic}" for topic in topics) or "No topics identified.",
-            inline=False,
+        related = _related_markets_field(matches)
+        if related:
+            embed.add_field(
+                name="Related Markets",
+                value=related,
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="Related Markets",
+                value="No actively correlated market this cycle.",
+                inline=False,
+            )
+
+        embed.set_footer(
+            text=f"Sovereign Predicts | {source_name} | "
+            f"{discord.utils.format_dt(published_at, style='R') if published_at else 'publication time unknown'}",
         )
-        embed.add_field(
-            name="Source",
-            value=source_name[:1024],
-            inline=True,
-        )
-        embed.add_field(
-            name="Published",
-            value=(
-                discord.utils.format_dt(published_at, style="f")
-                if published_at is not None
-                else "Not provided by source"
-            ),
-            inline=True,
-        )
-        market = article.get("_polymarket_market")
-        if isinstance(market, dict):
-            market_question = clean_article_text(market.get("question"))
-            market_url = market.get("url")
-            if market_question and isinstance(market_url, str):
-                embed.add_field(
-                    name="Polymarket Market",
-                    value=f"{market_question[:300]}\n[Open this market]({market_url})",
-                    inline=False,
-                )
-        embed.set_footer(text="Market Intel • Lash News Bot")
         return embed
 
     @commands.command(name="test")
     async def test_command(self, ctx: commands.Context[commands.Bot]) -> None:
         await ctx.reply(
-            "Lash News Bot is online and ready to monitor news.",
+            "Sovereign Predicts is online and ready to monitor news.",
             mention_author=False,
         )
 
@@ -2609,7 +3627,7 @@ def main() -> None:
     except discord.PrivilegedIntentsRequired as exc:
         raise SystemExit(
             "Enable Message Content Intent in Discord Developer Portal > Bot, "
-            "then restart Lash News Bot."
+            "then restart Sovereign Predicts."
         ) from exc
 
 
