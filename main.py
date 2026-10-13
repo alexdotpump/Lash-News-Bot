@@ -101,6 +101,20 @@ MIN_CORRELATION_FOR_ALERT = 85
 MIN_CORRELATION_FOR_DIAGNOSTICS = 70
 MAX_RELATED_MARKETS = 3
 
+# Discord's hard embed limits. Exceeding any of them rejects the whole message
+# with "Invalid Form Body", which would silently drop an alert, so every embed is
+# clamped to these values immediately before it is sent.
+EMBED_TITLE_LIMIT = 256
+EMBED_DESCRIPTION_LIMIT = 4096
+EMBED_FIELD_NAME_LIMIT = 256
+EMBED_FIELD_VALUE_LIMIT = 1024
+EMBED_FIELD_COUNT_LIMIT = 25
+EMBED_FOOTER_LIMIT = 2048
+EMBED_AUTHOR_LIMIT = 256
+# Discord rejects empty field names and values; this placeholder keeps a
+# trimmed field valid without adding visible clutter.
+EMPTY_EMBED_TEXT = "\u200b"
+
 # News source behavior.
 # The bot keeps its current working provider as the default and primary fallback.
 # A modular source adapter is introduced so another provider can be wired in later
@@ -1314,13 +1328,76 @@ def _related_markets_field(matches: list[MarketMatch]) -> str:
         score = match.score
         relationship = match.relationship
 
-        line = f"• [{market_link}] {question} — Correlation: {score}%"
-        lines.append(line)
+        entry = [f"• [{market_link}] {question} — Correlation: {score}%"]
         if match.why_short:
-            lines.append(f"    * {match.why_short}")
+            entry.append(f"    * {match.why_short}")
         if match.explanation and len(match.explanation) <= 300 and relationship in {"Direct", "Strong indirect"}:
-            lines.append(f"    * Why it matches: {match.explanation}")
-    return "\n".join(lines)
+            entry.append(f"    * Why it matches: {match.explanation}")
+
+        # Keep whole market entries: an entry that would overflow the field is
+        # dropped rather than cut in half, so every market shown stays readable.
+        if lines and len("\n".join(lines + entry)) > EMBED_FIELD_VALUE_LIMIT:
+            logger.debug("Related Markets field is full; later markets omitted.")
+            break
+        lines.extend(entry)
+
+    field_text = "\n".join(lines)
+    if len(field_text) > EMBED_FIELD_VALUE_LIMIT:
+        logger.debug(
+            "A single Related Markets entry exceeded %d characters and was clamped.",
+            EMBED_FIELD_VALUE_LIMIT,
+        )
+    return fit_embed_text(field_text, EMBED_FIELD_VALUE_LIMIT)
+
+
+def fit_embed_text(value: Any, limit: int) -> str:
+    """Clamp one embed string to a Discord hard limit, leaving it intact when it fits."""
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def sanitize_embed(embed: discord.Embed) -> discord.Embed:
+    """Clamp a built embed to Discord's hard limits so a long alert still posts.
+
+    Discord rejects the entire message with "Invalid Form Body" when a single
+    embed string is over its limit, which would silently drop the alert. Clamping
+    at the single send boundary trims the text instead of losing the message.
+    """
+    embed.title = fit_embed_text(embed.title, EMBED_TITLE_LIMIT) or None
+    embed.description = fit_embed_text(embed.description, EMBED_DESCRIPTION_LIMIT) or None
+    clamped_fields: list[tuple[str, str, bool]] = []
+    for field in embed.fields:
+        if len(clamped_fields) >= EMBED_FIELD_COUNT_LIMIT:
+            break
+        clamped_fields.append(
+            (
+                fit_embed_text(field.name, EMBED_FIELD_NAME_LIMIT),
+                fit_embed_text(field.value, EMBED_FIELD_VALUE_LIMIT),
+                field.inline,
+            )
+        )
+    embed.clear_fields()
+    for name, value, inline in clamped_fields:
+        embed.add_field(name=name or EMPTY_EMBED_TEXT, value=value or EMPTY_EMBED_TEXT, inline=inline)
+
+    footer = embed.footer
+    if footer is not None and footer.text:
+        embed.set_footer(
+            text=fit_embed_text(footer.text, EMBED_FOOTER_LIMIT),
+            icon_url=footer.icon_url,
+        )
+
+    author = embed.author
+    if author is not None and author.name:
+        embed.set_author(
+            name=fit_embed_text(author.name, EMBED_AUTHOR_LIMIT),
+            url=author.url,
+            icon_url=author.icon_url,
+        )
+
+    return embed
 
 
 # ---------------------------------------------------------------------------
@@ -1844,7 +1921,7 @@ class LashNewsBot(commands.Bot):
         """Post one embed, logging instead of raising on a Discord failure."""
         try:
             await channel.send(
-                embed=embed,
+                embed=sanitize_embed(embed),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return True

@@ -16,6 +16,8 @@ sys.path.insert(0, REPO_ROOT)
 os.environ.setdefault("DISCORD_BOT_TOKEN", "dummy.token.value")
 os.environ.setdefault("NEWS_API_KEY", "dummy-news-key")
 
+import discord  # noqa: E402
+
 import main  # noqa: E402
 
 
@@ -434,6 +436,62 @@ class EmbedFormatTests(unittest.TestCase):
         embed = self.bot.make_news_embed(article(), [])
         self.assertIn("Market Intel", embed.title)
 
+    def test_related_markets_field_is_clamped_to_the_discord_limit(self):
+        long_question = (
+            "Will Brent crude settle above ninety dollars before December 31? " * 25
+        )
+        match = main.MarketMatch(
+            market=market(question=long_question, slug="brent-very-long"),
+            score=90,
+            relationship="Direct",
+            explanation="The article reports the supply decision this market resolves on.",
+            why_short="Reports the crude supply decision.",
+        )
+        field = main._related_markets_field([match])
+        self.assertLessEqual(len(field), main.EMBED_FIELD_VALUE_LIMIT)
+        self.assertTrue(field.endswith("\u2026"))
+
+    def test_related_markets_field_drops_whole_entries_when_full(self):
+        entries = [
+            main.MarketMatch(
+                market=market(
+                    question=(
+                        f"Will Brent crude settle above {level} dollars before "
+                        "December 31?"
+                    ),
+                    slug=f"brent-{level}",
+                ),
+                score=90,
+                relationship="Direct",
+                explanation="The article reports the supply decision this market resolves on.",
+                why_short="Reports the crude supply decision.",
+            )
+            for level in (80, 85, 90, 95)
+        ]
+        field = main._related_markets_field(entries)
+        self.assertLessEqual(len(field), main.EMBED_FIELD_VALUE_LIMIT)
+        self.assertIn("brent-80", field)
+        self.assertNotIn("brent-95", field)
+
+    def test_sanitize_embed_clamps_every_over_long_part(self):
+        embed = discord.Embed(title="T" * 400, description="D" * 5000)
+        embed.add_field(name="N" * 400, value="V" * 5000, inline=False)
+        for index in range(29):
+            embed.add_field(name=f"field-{index}", value="V" * 5000, inline=False)
+        embed.set_footer(text="F" * 3000)
+        embed.set_author(name="A" * 400)
+        main.sanitize_embed(embed)
+        self.assertEqual(len(embed.title), main.EMBED_TITLE_LIMIT)
+        self.assertEqual(len(embed.description), main.EMBED_DESCRIPTION_LIMIT)
+        self.assertEqual(len(embed.fields), main.EMBED_FIELD_COUNT_LIMIT)
+        for field in embed.fields:
+            self.assertLessEqual(len(field.name), main.EMBED_FIELD_NAME_LIMIT)
+            self.assertLessEqual(len(field.value), main.EMBED_FIELD_VALUE_LIMIT)
+        self.assertEqual(len(embed.footer.text), main.EMBED_FOOTER_LIMIT)
+        self.assertEqual(len(embed.author.name), main.EMBED_AUTHOR_LIMIT)
+        self.assertTrue(embed.fields[0].value.endswith("\u2026"))
+        self.assertEqual(len(embed.fields[0].name), main.EMBED_FIELD_NAME_LIMIT)
+
 
 class ProviderAndFailureTests(unittest.TestCase):
     def test_build_news_provider_requires_approved_provider(self):
@@ -495,6 +553,44 @@ class FakeChannel:
         self.mention = f"<#{channel_id}>"
 
 
+class ValidatingFakeChannel(FakeChannel):
+    """Stand-in for Discord that rejects embeds over the documented limits.
+
+    Discord answers an over-long embed with HTTP 400 "Invalid Form Body", so the
+    checks here mirror that behaviour: an alert that Discord would drop fails the
+    test instead of disappearing quietly.
+    """
+
+    def __init__(self, channel_id: int = 555) -> None:
+        super().__init__(channel_id)
+        self.sent_embeds: list = []
+
+    async def send(self, *, embed=None, allowed_mentions=None):
+        self.assert_embed_is_valid(embed)
+        self.sent_embeds.append(embed)
+
+    def assert_embed_is_valid(self, embed) -> None:
+        if embed is None:
+            raise AssertionError("an embed is required")
+        if embed.title and len(embed.title) > main.EMBED_TITLE_LIMIT:
+            raise AssertionError("embed title is over Discord's limit")
+        if embed.description and len(embed.description) > main.EMBED_DESCRIPTION_LIMIT:
+            raise AssertionError("embed description is over Discord's limit")
+        if len(embed.fields) > main.EMBED_FIELD_COUNT_LIMIT:
+            raise AssertionError("embed has too many fields")
+        for field in embed.fields:
+            if len(field.name) > main.EMBED_FIELD_NAME_LIMIT:
+                raise AssertionError("field name is over Discord's limit")
+            if len(field.value) > main.EMBED_FIELD_VALUE_LIMIT:
+                raise AssertionError(
+                    "field value is over Discord's limit: "
+                    f"{field.name!r} ({len(field.value)} characters)"
+                )
+        if embed.footer and embed.footer.text:
+            if len(embed.footer.text) > main.EMBED_FOOTER_LIMIT:
+                raise AssertionError("embed footer is over Discord's limit")
+
+
 class NewsCycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
     """End-to-end coverage of the correlation pipeline through run_news_cycle."""
 
@@ -507,7 +603,7 @@ class NewsCycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         os.chdir(self._cwd)
         self._tmp.cleanup()
 
-    async def _bot(self, *, articles, markets):
+    async def _bot(self, *, articles, markets, stub_post: bool = True):
         bot = main.create_bot()
         bot._connection.application_id = 1
 
@@ -538,7 +634,8 @@ class NewsCycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.posts.append((guild_id, embed))
             return True
 
-        bot.send_embed = record
+        if stub_post:
+            bot.send_embed = record
         bot.ensure_settings("1")
         bot.ensure_guild_history("1")
         self.addAsyncCleanup(bot.close)
@@ -577,6 +674,41 @@ class NewsCycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await bot.run_news_cycle({"1": FakeChannel()})
         self.assertEqual(self.posts, [])
 
+    async def test_real_send_path_trims_an_over_long_embed(self):
+        bot = await self._bot(articles=[], markets=[], stub_post=False)
+        channel = ValidatingFakeChannel()
+        embed = discord.Embed(
+            title="Market Intel | Sovereign Predicts",
+            description="https://example.test/" + "d" * 5000,
+        )
+        embed.add_field(name="Summary", value="S" * 4000, inline=False)
+        embed.add_field(name="Related Markets", value="R" * 4000, inline=False)
+        posted = await bot.send_embed(channel, embed, "1")
+        self.assertTrue(posted, "the trimmed alert must still post")
+        self.assertEqual(len(channel.sent_embeds), 1)
+        sent = channel.sent_embeds[0]
+        self.assertLessEqual(len(sent.description), main.EMBED_DESCRIPTION_LIMIT)
+        for field in sent.fields:
+            self.assertLessEqual(len(field.value), main.EMBED_FIELD_VALUE_LIMIT)
+
+    async def test_news_cycle_alert_satisfies_discord_limits(self):
+        article_fixture = article(
+            **dict(UKRAINE_ARTICLE, url="https://example.test/ukraine")
+        )
+        bot = await self._bot(
+            articles=[article_fixture],
+            markets=[market(**UKRAINE_MARKET)],
+            stub_post=False,
+        )
+        channel = ValidatingFakeChannel()
+        await bot.run_news_cycle({"1": channel})
+        self.assertEqual(len(channel.sent_embeds), 1)
+        related = next(
+            field.value
+            for field in channel.sent_embeds[0].fields
+            if field.name == "Related Markets"
+        )
+        self.assertIn("Correlation:", related)
 
 if __name__ == "__main__":
     unittest.main()
