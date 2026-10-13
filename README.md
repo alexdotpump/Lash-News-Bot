@@ -46,8 +46,10 @@ after every deploy.
 ## Alert types
 
 - **News** — a NewsAPI query built from the questions of active, high-volume Polymarket
-  markets (plus each server's include keywords). Only articles matching an open market are
-  posted, and each server applies its own include/exclude keyword and publisher filters.
+  markets (plus each server's include keywords). Each candidate article is then evaluated
+  against the active market catalog by a market-aware correlation engine (see below) before
+  anything is posted, and each server applies its own include/exclude keyword and publisher
+  filters.
 - **Price moves** — watches the top markets by 24-hour volume and alerts when an outcome's
   price moves past this server's threshold. The first sighting only records a baseline, so
   deploying never triggers a burst of alerts.
@@ -57,6 +59,39 @@ after every deploy.
   `taker_only=true` and a server-side `filter_type=CASH` floor) so only **executed taker
   fills** alert, never open orders or positions. Each embed says so explicitly and links the
   transaction on Polygonscan.
+
+### News correlation engine
+
+News alerts are not keyword matches. Every candidate article is scored against the active
+market catalog and only genuinely related stories are posted.
+
+- **Candidate filtering** — cheap entity and question-term overlap narrows the catalog before
+  the deeper scorer runs, so the expensive path is never applied to every article/market pair.
+- **Relationship classification** — each evaluated pair is classified as `Direct` (the article
+  reports the event or decision the market resolves on), `Strong indirect` (credible
+  information with a clear, explainable relationship to the outcome), `Contextual`
+  (background only), or `Unrelated`.
+- **Correlation score (0-100)** — an estimate of *this article's relevance to this specific
+  market question*. It is **not** a prediction that the market resolves YES and **not** a
+  probability of any outcome. Scores combine entity correspondence, question focus terms,
+  source reliability, resolution-criteria compatibility, time-frame compatibility, and
+  penalties for superficial keyword overlap, stale articles, and unsupported claims.
+- **Alert policy** — a match is posted only when its score is at least
+  `MIN_CORRELATION_FOR_ALERT` (default 85) **and** its classification is `Direct` or
+  `Strong indirect`. Matches scoring at or above `MIN_CORRELATION_FOR_DIAGNOSTICS`
+  (default 70) are retained for diagnostics; everything below is rejected. An unrelated story
+  is never promoted merely because it shares keywords.
+- **Self-explaining matches** — each accepted match carries a short, article-grounded reason
+  describing why this story matters to that market. The engine never invents facts,
+  resolution rules, or causal links the evidence does not support.
+- **Dedup** — canonical URL plus a normalized content fingerprint collapses repeated polling,
+  minor headline variants, and syndicated copies so one story does not alert twice.
+- **Source adapter** — providers are plugged in behind a small adapter interface. `NewsAPI` is
+  the default and remains the fallback; no additional provider is enabled without a key.
+
+These thresholds (`MIN_CORRELATION_FOR_ALERT`, `MIN_CORRELATION_FOR_DIAGNOSTICS`,
+`MAX_RELATED_MARKETS`) are code-level calibration constants, not per-server settings and not
+secrets.
 
 ### Rate and noise limits
 
@@ -91,7 +126,8 @@ If commands appear but answering them fails, or they never appear at all:
 - `main.py` — monitoring loops, alert embeds, per-server settings, and commands.
 - `requirements.txt` — Python dependencies.
 - `tests/` — unit tests for command registration/invocation, HTTP retries, per-server
-  settings persistence, and the monitors.
+  settings persistence, the monitors, and the news correlation engine
+  (`tests/test_correlation.py`).
 - `guild_settings.json` — per-server settings (created at runtime, in `STATE_DIR`).
 - `monitor_state.json` — cross-restart dedupe and price baselines (in `STATE_DIR`).
 - `seen_articles_by_guild.json` — duplicate history kept independently for each server.
