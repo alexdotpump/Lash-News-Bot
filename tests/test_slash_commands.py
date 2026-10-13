@@ -44,6 +44,10 @@ class FakeResponse:
         self.done = True
         self.sent.append(("send_message", {"content": content, **kwargs}))
 
+    async def defer(self, *, ephemeral=False, thinking=False):
+        self.done = True
+        self.sent.append(("defer", {"ephemeral": ephemeral, "thinking": thinking}))
+
 
 class FakeFollowup:
     def __init__(self) -> None:
@@ -296,6 +300,70 @@ class CommandInvocationTests(BotTestCase):
                         f"/{command.name} takes self but has no binding, so "
                         f"discord.py would call it without self",
                     )
+        finally:
+            await bot.close()
+
+
+class GuildSyncPayloadTests(BotTestCase):
+    """Regression tests for guild syncs that posted an empty command list.
+
+    ``tree.add_command`` registers commands globally, and discord.py only sends
+    the commands registered *for that guild* during a guild sync. Syncing a guild
+    without ``copy_global_to`` first therefore posts an empty list and reports
+    "Synced 0 commands", so neither a development server nor ``/sync`` ever
+    receives the instant registration it promises. These tests assert on the
+    exact payload the tree hands to Discord, which is
+    ``len(tree.get_commands(guild=...))``.
+    """
+
+    async def _bot_recording_sync_payloads(self, **env):
+        bot = await self._build_bot(**env)
+        payloads: list[tuple[int, int]] = []
+
+        async def recording_sync(guild=None):
+            commands = (
+                bot.tree.get_commands()
+                if guild is None
+                else bot.tree.get_commands(guild=guild)
+            )
+            payloads.append((guild.id if guild else 0, len(commands)))
+            return commands
+
+        bot.tree.sync = recording_sync
+        return bot, payloads
+
+    async def test_dev_guild_sync_sends_every_registered_command(self):
+        bot, payloads = await self._bot_recording_sync_payloads(
+            DISCORD_DEV_GUILD_ID="111"
+        )
+        try:
+            await bot.setup_hook()
+            guild_payloads = [count for guild_id, count in payloads if guild_id == 111]
+            self.assertEqual(
+                guild_payloads,
+                [len(EXPECTED_COMMANDS)],
+                "a development-server sync must push the commands, not an "
+                "empty list",
+            )
+        finally:
+            await bot.close()
+
+    async def test_sync_command_sends_every_registered_command_to_the_server(self):
+        bot, payloads = await self._bot_recording_sync_payloads()
+        try:
+            await bot.setup_hook()
+            payloads.clear()
+            command = bot.tree.get_command("sync")
+            interaction = BoundInteraction("sync")
+            interaction.user.id = main.OWNER_ID
+            await command._do_call(interaction, {})
+            guild_payloads = [count for guild_id, count in payloads if guild_id == 2]
+            self.assertEqual(
+                guild_payloads,
+                [len(EXPECTED_COMMANDS)],
+                "/sync must push the commands to the server, not an empty list",
+            )
+            self.assertTrue(interaction.followup.sent)
         finally:
             await bot.close()
 
