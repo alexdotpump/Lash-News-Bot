@@ -797,6 +797,21 @@ class LashNewsBot(commands.Bot):
         logger.info("Received SIGTERM; shutting down gracefully.")
         asyncio.get_running_loop().create_task(self.close())
 
+    async def sync_guild_commands(self, guild_id: int) -> list[app_commands.AppCommand]:
+        """Register the commands for one server so they appear immediately.
+
+        Commands are added to the tree globally (``tree.add_command``), and
+        discord.py only sends the commands registered *for that guild* when
+        syncing one. Syncing a guild without copying the global commands into it
+        first therefore pushes an empty list and reports "Synced 0 commands",
+        leaving the server to wait for Discord's global propagation window. The
+        copy is refreshed on every call so a server always receives the current
+        command set, including a command added after the last sync.
+        """
+        guild = discord.Object(id=guild_id)
+        self.tree.copy_global_to(guild=guild)
+        return await self.tree.sync(guild=guild)
+
     async def sync_application_commands(self) -> None:
         """Register slash commands once per process without spamming Discord.
 
@@ -810,7 +825,7 @@ class LashNewsBot(commands.Bot):
 
         for guild_id in self.dev_guild_ids:
             try:
-                synced = await self.tree.sync(guild=discord.Object(id=guild_id))
+                synced = await self.sync_guild_commands(guild_id)
             except Exception:
                 logger.exception(
                     "Failed to sync slash commands to development server %s.",
@@ -1618,9 +1633,7 @@ class LashNewsBot(commands.Bot):
 
         if interaction.guild_id is not None:
             try:
-                synced = await self.tree.sync(
-                    guild=discord.Object(id=interaction.guild_id)
-                )
+                synced = await self.sync_guild_commands(interaction.guild_id)
                 lines.append(
                     f"Synced {len(synced)} commands to this server (instant)."
                 )
