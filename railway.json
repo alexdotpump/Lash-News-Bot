@@ -4,6 +4,7 @@
     "builder": "DOCKERFILE",
     "dockerfilePath": "Dockerfile"
   },
+
   "deploy": {
     "startCommand": "python -u main.py",
     "restartPolicyType": "ON_FAILURE",

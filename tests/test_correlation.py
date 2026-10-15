@@ -372,13 +372,15 @@ class EmbedFormatTests(unittest.TestCase):
     def setUp(self):
         self.bot = FakeBotForEmbed()
 
-    def test_embed_has_spec_title_and_blue_accent(self):
+    def test_embed_has_spec_title_and_classic_gold_accent(self):
         match = main.compute_correlation(article(**UKRAINE_ARTICLE), market(**UKRAINE_MARKET))
         embed = self.bot.make_news_embed(article(**UKRAINE_ARTICLE), [match] if match else [])
         self.assertEqual(embed.title, "Market Intel | Sovereign Predicts")
-        rgb = embed.color.value
-        # Blue accent: blue channel dominant.
-        self.assertGreaterEqual(rgb & 0xFF, 200)
+        # The classic SovereignBot gold/brown (rgb(198, 161, 91)), restored
+        # from the original embeds in git history after the correlation
+        # redesign briefly switched news alerts to blue.
+        self.assertEqual(embed.color, main.SOVEREIGN_COLOR)
+        self.assertEqual(embed.color.value, 0xC6A15B)
 
     def test_embed_has_news_link_summary_and_related_markets(self):
         art = article(**dict(UKRAINE_ARTICLE, url="https://example.test/article"))

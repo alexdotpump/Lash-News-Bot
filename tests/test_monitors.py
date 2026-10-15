@@ -303,10 +303,10 @@ class MonitorCycleIsolationTests(MonitorTestCase):
         bot.run_price_cycle = ok
         bot.run_whale_cycle = ok
 
-        async def destinations():
-            return {"1": FakeChannel()}
+        async def destinations_by_category():
+            return {category: {"1": FakeChannel()} for category in main.ALERT_TYPES}
 
-        bot.get_alert_channels = destinations
+        bot.get_alert_destinations = destinations_by_category
 
         class FakeSession:
             async def close(self):

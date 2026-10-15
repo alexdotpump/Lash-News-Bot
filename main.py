@@ -2,6 +2,7 @@
 
 import asyncio
 import html
+import io
 import json
 import logging
 import os
@@ -23,6 +24,8 @@ POLYMARKET_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
 POLYMARKET_DATA_API_URL = "https://data-api.polymarket.com"
 POLYMARKET_TRADES_URL = f"{POLYMARKET_DATA_API_URL}/v2/trades"
 POLYMARKET_MARKET_PAGE = "https://polymarket.com/market"
+# Polymarket's CLOB price-history endpoint, used by /chart.
+POLYMARKET_PRICE_HISTORY_URL = "https://clob.polymarket.com/prices-history"
 POLYGON_EXPLORER_TX = "https://polygonscan.com/tx"
 
 # Railway (and most container hosts) wipe the filesystem on every deploy, so
@@ -65,10 +68,17 @@ DEFAULT_NEW_MARKET_MIN_LIQUIDITY = 0.0
 MIN_PRICE_ALERT_LIQUIDITY = 5_000.0
 ALERT_TYPES = ("news", "price", "new_market", "whale")
 ALERT_LABELS = {
-    "news": "News matching a market",
-    "price": "Market price moves",
-    "new_market": "New markets",
-    "whale": "Large trades",
+    "news": "News alerts",
+    "price": "Price alerts",
+    "new_market": "New market alerts",
+    "whale": "Whale alerts",
+}
+# The slash command that points one alert category at its own channel.
+ALERT_CHANNEL_COMMANDS = {
+    "news": "/set-news-alerts",
+    "price": "/set-price-alerts",
+    "new_market": "/set-new-markets",
+    "whale": "/set-whale-alerts",
 }
 
 
@@ -113,6 +123,12 @@ EMBED_FOOTER_LIMIT = 2048
 EMBED_AUTHOR_LIMIT = 256
 # Discord rejects empty field names and values; this placeholder keeps a
 # trimmed field valid without adding visible clutter.
+# The classic Sovereign palette: gold for news and market alerts, green for
+# large buys, red for large sells.
+SOVEREIGN_COLOR = discord.Color.from_rgb(198, 161, 91)
+WHALE_BUY_COLOR = discord.Color.green()
+WHALE_SELL_COLOR = discord.Color.red()
+
 EMPTY_EMBED_TEXT = "\u200b"
 
 # News source behavior.
@@ -1225,23 +1241,76 @@ class NewsAPIAdapter(NewsSourceAdapter):
 
     name = DEFAULT_NEWS_SOURCE_NAME
 
-    def __init__(self, session, api_key: str) -> None:
+    def __init__(
+        self,
+        session,
+        api_key: str,
+        *,
+        api_keys: list[str] | None = None,
+        language: str | None = None,
+        request_json=None,
+    ) -> None:
         self._session = session
-        self._api_key = api_key
+        self.api_key = api_key
+        # The configured key list, in the order the keys are tried.
+        self.api_keys = list(api_keys or [])
+        self.language = language or os.getenv("NEWS_LANGUAGE", "en")
+        self._request_json = request_json
+
+    def candidate_keys(self) -> list[str]:
+        """Every key to try: the primary first, blanks and repeats removed."""
+        keys: list[str] = []
+        for key in [self.api_key, *self.api_keys]:
+            if isinstance(key, str) and key and key not in keys:
+                keys.append(key)
+        return keys
+
+    async def _request_page(self, params: dict[str, Any], key: str) -> Any:
+        headers = {"X-Api-Key": key}
+        if self._request_json is not None:
+            return await self._request_json(
+                NEWS_API_URL, params=params, headers=headers
+            )
+        return await self._session.get_json(
+            NEWS_API_URL, params=params, headers=headers
+        )
 
     async def fetch_articles(self, query: str) -> list[dict[str, Any]]:
-        if not self._api_key:
+        """Fetch articles, falling through to the spare keys when throttled.
+
+        A single NewsAPI key is limited to 100 requests a day, which one
+        monitoring loop can exhaust, so a rejected key must not fail the whole
+        poll while another key is configured. The final key's error is raised.
+        """
+        keys = self.candidate_keys()
+        if not keys:
             raise RuntimeError("NewsAPI key is not configured.")
+
+        for index, key in enumerate(keys):
+            try:
+                return await self._fetch_with_key(query, key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if index == len(keys) - 1:
+                    raise
+                logger.warning(
+                    "NewsAPI key %d of %d was rejected (%s); trying the next "
+                    "key.",
+                    index + 1,
+                    len(keys),
+                    exc,
+                )
+        raise RuntimeError("NewsAPI request failed.")
+
+    async def _fetch_with_key(self, query: str, key: str) -> list[dict[str, Any]]:
         params = {
             "q": query,
-            "language": os.getenv("NEWS_LANGUAGE", "en"),
+            "language": self.language,
             "sortBy": "publishedAt",
             "pageSize": 20,
         }
-        headers = {"X-Api-Key": self._api_key}
-        payload = await self._session.get_json(
-            NEWS_API_URL, params=params, headers=headers
-        )
+        payload = await self._request_page(params, key)
         if not isinstance(payload, dict):
             raise RuntimeError("NewsAPI returned an unexpected response body.")
         if payload.get("status") != "ok":
@@ -1258,6 +1327,8 @@ def build_news_provider(
     *,
     api_key: str,
     provider_name: str = DEFAULT_NEWS_SOURCE_NAME,
+    api_keys: list[str] | None = None,
+    language: str | None = None,
 ) -> NewsSourceAdapter:
     """Build the active news provider from configuration.
 
@@ -1271,7 +1342,9 @@ def build_news_provider(
             f"News provider '{name}' is not configured. Only '{DEFAULT_NEWS_SOURCE_NAME}' "
             "is supported without additional setup."
         )
-    return NewsAPIAdapter(session, api_key)
+    return NewsAPIAdapter(
+        session, api_key, api_keys=api_keys, language=language
+    )
 
 
 def select_polymarket_market(
@@ -1442,6 +1515,8 @@ def default_guild_settings() -> dict[str, Any]:
     """The full set of per-server defaults (always the same shape)."""
     return {
         "channel_id": None,
+        # Per-category channel overrides; None means "use the default channel".
+        "channels": {alert: None for alert in ALERT_TYPES},
         "include_keywords": [],
         "exclude_keywords": [],
         "sources": [],
@@ -1465,6 +1540,17 @@ def normalize_guild_settings(raw: Any) -> dict[str, Any]:
     channel_id = raw.get("channel_id")
     if isinstance(channel_id, int) and not isinstance(channel_id, bool) and channel_id > 0:
         settings["channel_id"] = channel_id
+
+    channels = raw.get("channels")
+    if isinstance(channels, dict):
+        for alert in ALERT_TYPES:
+            candidate = channels.get(alert)
+            if (
+                isinstance(candidate, int)
+                and not isinstance(candidate, bool)
+                and candidate > 0
+            ):
+                settings["channels"][alert] = candidate
 
     for key, limit in (
         ("include_keywords", MAX_KEYWORDS_PER_GUILD),
@@ -1491,6 +1577,44 @@ def normalize_guild_settings(raw: Any) -> dict[str, Any]:
             settings[key] = clamp(number, low, high)
 
     return settings
+
+
+def effective_channel_id(
+    settings: dict[str, Any], alert: str | None = None
+) -> int | None:
+    """The channel one alert category posts to, or None when unconfigured.
+
+    A category's own channel wins; otherwise the server's default channel is
+    used. ``alert=None`` asks for the default channel directly.
+    """
+    channels = settings.get("channels")
+    if alert is not None and isinstance(channels, dict):
+        override = channels.get(alert)
+        if (
+            isinstance(override, int)
+            and not isinstance(override, bool)
+            and override > 0
+        ):
+            return override
+    default = settings.get("channel_id")
+    if isinstance(default, int) and not isinstance(default, bool) and default > 0:
+        return default
+    return None
+
+
+def parse_news_api_keys(raw: str | None, primary: str | None) -> list[str]:
+    """Parse extra NewsAPI keys, tried in order when the primary is throttled.
+
+    ``NEWS_API_KEYS`` is comma or semicolon separated. Blanks, repeats, and the
+    primary key itself are dropped so no key is ever tried twice.
+    """
+    keys: list[str] = []
+    for chunk in re.split(r"[,;]", raw or ""):
+        key = chunk.strip()
+        if not key or key == primary or key in keys:
+            continue
+        keys.append(key)
+    return keys
 
 
 def load_guild_settings() -> dict[str, dict[str, Any]]:
@@ -1587,6 +1711,123 @@ def save_monitor_state(state: dict[str, Any]) -> None:
     write_json_atomically(MONITOR_STATE_FILE, state)
 
 
+# ---------------------------------------------------------------------------
+# /chart: Polymarket price history and PNG rendering
+# ---------------------------------------------------------------------------
+
+
+def parse_price_history(payload: Any) -> list[tuple[int, float]]:
+    """Parse a CLOB prices-history payload into sorted (timestamp, price) points.
+
+    The series is trusted as a whole: one malformed point makes the chart
+    unfaithful, so this returns an empty list rather than a partial line.
+    """
+    if not isinstance(payload, dict):
+        return []
+    history = payload.get("history")
+    if not isinstance(history, list):
+        return []
+    points: list[tuple[int, float]] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            return []
+        timestamp = entry.get("t")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            return []
+        price = as_float(entry.get("p"))
+        if price is None:
+            return []
+        points.append((int(timestamp), price))
+    points.sort(key=lambda point: point[0])
+    return points
+
+
+def first_clob_token_id(market: dict[str, Any]) -> str | None:
+    """The first CLOB token id of a market (Gamma returns a JSON-encoded list)."""
+    raw = market.get("clobTokenIds")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw, list):
+        return None
+    for token in raw:
+        if isinstance(token, str) and token.strip():
+            return token.strip()
+        if isinstance(token, int) and not isinstance(token, bool):
+            return str(token)
+    return None
+
+
+def chart_interval(days: int) -> str:
+    """Map a lookback in days onto the CLOB's supported interval values."""
+    if days <= 1:
+        return "1d"
+    if days <= 7:
+        return "1w"
+    if days <= 30:
+        return "1m"
+    return "max"
+
+
+# CLOB "fidelity" is the resolution in minutes, and the API enforces a
+# minimum per interval (1w rejects anything under 5, 1m rejects anything
+# under 10). At its minimum a 1m window returns thousands of points, so the
+# first value is the readable resolution and the second is the finest the
+# API accepts, used as a fallback for markets with very little history.
+CHART_FIDELITY_MINUTES = {
+    "1d": (5, 1),
+    "1w": (60, 5),
+    "1m": (180, 10),
+    "max": (1440, 60),
+}
+
+
+def render_price_chart(
+    *,
+    question: str,
+    slug: str,
+    outcome_label: str,
+    points: list[tuple[int, float]],
+) -> bytes:
+    """Render one market's price history as a PNG in the Sovereign palette.
+
+    matplotlib is imported here rather than at module scope so a broken install
+    disables /chart instead of stopping the whole bot from starting.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+
+    times = [datetime.fromtimestamp(point[0], tz=timezone.utc) for point in points]
+    odds = [point[1] * 100.0 for point in points]
+
+    figure, axes = plt.subplots(figsize=(8.0, 4.0), dpi=140)
+    figure.patch.set_facecolor("#12100E")
+    axes.set_facecolor("#12100E")
+    axes.plot(times, odds, color="#C6A15B", linewidth=2.0)
+    axes.fill_between(times, odds, min(odds), color="#C6A15B", alpha=0.12)
+    axes.set_title(
+        fit_embed_text(f"{question} | {outcome_label}", 110),
+        color="#F3E4C2",
+        fontsize=11,
+    )
+    axes.set_ylabel("Implied probability (%)", color="#F3E4C2", fontsize=9)
+    axes.tick_params(colors="#C6A15B", labelsize=8)
+    for spine in axes.spines.values():
+        spine.set_color("#3A332A")
+    axes.grid(color="#3A332A", linestyle=":", linewidth=0.6, alpha=0.6)
+    axes.set_xlabel(slug, color="#8A7F6B", fontsize=8)
+    figure.autofmt_xdate(rotation=20)
+    figure.tight_layout()
+    buffer = io.BytesIO()
+    figure.savefig(buffer, format="png", facecolor=figure.get_facecolor())
+    plt.close(figure)
+    return buffer.getvalue()
+
+
 class LashNewsBot(commands.Bot):
     def __init__(
         self,
@@ -1600,6 +1841,16 @@ class LashNewsBot(commands.Bot):
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
         self.news_api_key = news_api_key
+        # The primary key first, then any spares from NEWS_API_KEYS. The full
+        # ordered list is what the provider adapter rotates through.
+        self.news_api_keys = [
+            key
+            for key in [
+                news_api_key,
+                *parse_news_api_keys(os.getenv("NEWS_API_KEYS"), news_api_key),
+            ]
+            if key
+        ]
         self.channel_id = channel_id
         self.poll_interval = poll_interval
         self.dev_guild_ids = dev_guild_ids or []
@@ -1630,6 +1881,7 @@ class LashNewsBot(commands.Bot):
         self.consecutive_failures = 0
         self._monitor_running = False
         self._shutdown_requested = False
+        self._command_registration_checked = False
 
     def register_commands(self, *commands_to_add: app_commands.Command) -> None:
         """Attach command objects to the tree with this bot as their binding.
@@ -1673,6 +1925,14 @@ class LashNewsBot(commands.Bot):
             self.servers_slash,
             self.server_info_slash,
             self.sync_slash,
+            # Per-category channel configuration.
+            self.set_news_alerts_slash,
+            self.set_price_alerts_slash,
+            self.set_new_markets_slash,
+            self.set_whale_alerts_slash,
+            # Diagnostics and charting.
+            self.config_check_slash,
+            self.chart_slash,
         )
         # Route unhandled application-command errors away from the library's
         # silent default so failures are logged and the user gets a reply.
@@ -1839,6 +2099,107 @@ class LashNewsBot(commands.Bot):
             self.user,
             len(self.guilds),
         )
+        # Discord only reports the guild list once the gateway is up, so the
+        # duplicate-registration cleanup runs here, and once per process: a
+        # reconnect must not rewrite the command list again.
+        if not self._command_registration_checked:
+            self._command_registration_checked = True
+            await self.ensure_single_command_registration()
+
+    async def ensure_single_command_registration(self) -> None:
+        """Make every command show up exactly once in Discord.
+
+        Two different things make the same command appear twice in a server:
+
+        * the application allows user installation, so a global command is
+          published once for the server and once for the user; and
+        * registrations left behind by an earlier per-server sync, which
+          Discord keeps until the server list is overwritten.
+
+        Discord has no "remove just the duplicate" call, so the global list is
+        rewritten as guild-install only, and per-server lists left over from
+        other versions are cleared -- except the development servers, whose
+        fresh copy was just written by the sync above. Both steps need a
+        logged-in client, so this is a no-op while the command tree is being
+        exercised offline.
+        """
+        if self.application_id is None or self.http.token is None:
+            return
+        await self.normalize_command_install_scopes()
+        await self.clear_stale_guild_commands()
+
+    async def normalize_command_install_scopes(self) -> None:
+        """Publish the global commands for server installation only.
+
+        A command that is published for both install types is listed twice in
+        the picker even though it is the same command, which is what made the
+        bot look like it had duplicates. Rewriting the global registration with
+        ``integration_types=[0]`` leaves exactly one entry per command.
+        """
+        application_id = self.application_id
+        if application_id is None:
+            return
+        payloads: list[dict[str, Any]] = []
+        for command in self.tree.get_commands():
+            payload = command.to_dict()
+            payload["integration_types"] = [0]
+            payloads.append(payload)
+        try:
+            await self.http.bulk_upsert_global_commands(application_id, payloads)
+        except Exception:
+            logger.exception(
+                "Could not pin the global commands to server installation only."
+            )
+            return
+        logger.info(
+            "Pinned %d commands to server installation only, so each shows "
+            "once.",
+            len(payloads),
+        )
+
+    async def clear_stale_guild_commands(self) -> list[int]:
+        """Delete per-server registrations that duplicate the global ones.
+
+        Development servers are skipped: their registration is written fresh by
+        the sync above and is what makes commands appear there instantly.
+        """
+        application_id = self.application_id
+        if application_id is None:
+            return []
+        dev_guild_ids = set(self.dev_guild_ids)
+        cleared: list[int] = []
+        for guild in list(self.guilds):
+            if guild.id in dev_guild_ids:
+                continue
+            try:
+                existing = await self.http.get_guild_commands(
+                    application_id, guild.id
+                )
+            except Exception:
+                logger.warning(
+                    "Could not read the command list of server %s.", guild.id
+                )
+                continue
+            if not existing:
+                continue
+            try:
+                await self.http.bulk_upsert_guild_commands(
+                    application_id, guild.id, []
+                )
+            except Exception:
+                logger.exception(
+                    "Could not clear the duplicate commands of server %s.",
+                    guild.id,
+                )
+                continue
+            cleared.append(guild.id)
+            logger.info(
+                "Cleared %d duplicate per-server command registration(s) in "
+                "server %s; the global commands now serve it.",
+                len(existing),
+                guild.id,
+            )
+        return cleared
 
     async def resolve_channel(
         self,
@@ -1937,7 +2298,15 @@ class LashNewsBot(commands.Bot):
 
     async def get_alert_channels(
         self,
+        alert: str | None = None,
     ) -> dict[str, discord.TextChannel | discord.Thread]:
+        """Resolve which channel each server wants for one alert category.
+
+        ``alert`` selects a category, so a server can send whales to one
+        channel while news still uses its default. ``alert=None`` resolves the
+        default channel. A channel that cannot be resolved is reported; when
+        nothing at all resolves the failure is raised so the caller can decide.
+        """
         destinations: dict[str, discord.TextChannel | discord.Thread] = {}
         legacy_channel: discord.TextChannel | discord.Thread | None = None
         legacy_guild_id: str | None = None
@@ -1955,7 +2324,7 @@ class LashNewsBot(commands.Bot):
                 logger.exception("Could not resolve the legacy alert channel.")
 
         for guild_id, settings in list(self.guild_settings.items()):
-            channel_id = settings.get("channel_id")
+            channel_id = effective_channel_id(settings, alert)
             if channel_id is None:
                 continue
             try:
@@ -1965,13 +2334,17 @@ class LashNewsBot(commands.Bot):
             except Exception:
                 resolution_failures += 1
                 logger.exception(
-                    "Could not resolve the alert channel configured for server %s.",
+                    "Could not resolve the %s alert channel configured for "
+                    "server %s.",
+                    alert or "default",
                     guild_id,
                 )
                 continue
             if str(channel.guild.id) != guild_id:
                 logger.error(
-                    "Configured channel %s does not belong to server %s.",
+                    "Configured %s alert channel %s does not belong to "
+                    "server %s.",
+                    alert or "default",
                     channel_id,
                     guild_id,
                 )
@@ -1987,6 +2360,31 @@ class LashNewsBot(commands.Bot):
             destinations[legacy_guild_id] = legacy_channel
         if not destinations and resolution_failures:
             raise RuntimeError("Could not resolve any configured Discord alert channel.")
+
+        return destinations
+
+    async def get_alert_destinations(
+        self,
+    ) -> dict[str, dict[str, discord.TextChannel | discord.Thread]]:
+        """Resolve every alert category's destinations, isolating failures.
+
+        One deleted channel or a single failing lookup must never stop the other
+        alert categories from running, so each category resolves independently
+        and reports an empty mapping instead of raising.
+        """
+        destinations: dict[
+            str, dict[str, discord.TextChannel | discord.Thread]
+        ] = {}
+        for alert in ALERT_TYPES:
+            try:
+                destinations[alert] = await self.get_alert_channels(alert)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Could not resolve the %s alert channels this cycle.", alert
+                )
+                destinations[alert] = {}
         return destinations
 
     async def get_configured_channel(
@@ -2238,10 +2636,23 @@ class LashNewsBot(commands.Bot):
 
     @app_commands.command(
         name="test",
-        description="Send a test news alert to this server's configured channel.",
+        description="Send a test alert to this server's channel for one category.",
     )
     @app_commands.guild_only()
-    async def test_slash(self, interaction: discord.Interaction) -> None:
+    @app_commands.describe(
+        category="Which alert category to test (defaults to the main channel)."
+    )
+    @app_commands.choices(
+        category=[
+            app_commands.Choice(name=ALERT_LABELS[alert], value=alert)
+            for alert in ALERT_TYPES
+        ]
+    )
+    async def test_slash(
+        self,
+        interaction: discord.Interaction,
+        category: app_commands.Choice[str] | None = None,
+    ) -> None:
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message(
@@ -2250,26 +2661,53 @@ class LashNewsBot(commands.Bot):
             )
             return
         await interaction.response.defer(ephemeral=True)
+
+        alert = category.value if category is not None else None
+        settings = self.get_settings(guild.id)
+        channel_id = effective_channel_id(settings, alert)
+        if channel_id is None:
+            if alert is None:
+                await interaction.followup.send(
+                    "No alert channel is configured. Ask an administrator "
+                    "to run `/setup`.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"No {ALERT_LABELS[alert].lower()} channel is "
+                    "configured yet. Ask an administrator to run "
+                    f"`{ALERT_CHANNEL_COMMANDS[alert]}`.",
+                    ephemeral=True,
+                )
+            return
+
         try:
-            channel = await self.get_configured_channel(guild)
+            channel = await self.resolve_channel(channel_id)
         except Exception:
-            logger.exception("Could not resolve the configured channel for server %s.", guild.id)
+            logger.exception(
+                "Could not resolve the configured channel for server %s.",
+                guild.id,
+            )
             channel = None
-        if channel is None:
+        if channel is None or channel.guild.id != guild.id:
             await interaction.followup.send(
-                "No alert channel is configured. Ask an administrator to run `/setup`.",
+                "The configured alert channel is missing or belongs to "
+                "another server. Ask an administrator to configure it again.",
                 ephemeral=True,
             )
             return
+        self.ensure_guild_history(str(guild.id))
 
         now = datetime.now(timezone.utc)
+        label = ALERT_LABELS[alert] if alert is not None else "Alerts"
         embed = discord.Embed(
             title="Market Intel | Sovereign Predicts",
             description=(
-                "**Test alert**\n"
-                "This confirms that news alerts can be delivered to this channel."
+                f"**{label} test**\n"
+                f"This confirms that {label.lower()} can be delivered to "
+                "this channel."
             ),
-            color=discord.Color.from_rgb(198, 161, 91),
+            color=SOVEREIGN_COLOR,
             timestamp=now,
         )
         embed.add_field(
@@ -2307,6 +2745,452 @@ class LashNewsBot(commands.Bot):
             return
         await interaction.followup.send(
             f"Test alert sent to {channel.mention}.",
+            ephemeral=True,
+        )
+
+    async def apply_alert_channel(
+        self,
+        interaction: discord.Interaction,
+        alert: str,
+        channel: discord.TextChannel | None,
+    ) -> None:
+        """Point one alert category at its own channel, or clear that override.
+
+        Only the named category is touched, so changing whale alerts never
+        moves news, price, or new-market alerts. An omitted channel clears the
+        override and the category falls back to this server's default channel.
+        """
+        guild = interaction.guild
+        if not await self.require_admin(interaction) or guild is None:
+            return
+
+        label = ALERT_LABELS[alert]
+        settings = self.ensure_settings(guild.id)
+
+        if channel is None:
+            settings["channels"][alert] = None
+            if not self.save_settings():
+                await interaction.response.send_message(
+                    "I couldn't save this server's settings.", ephemeral=True
+                )
+                return
+            default_id = effective_channel_id(settings)
+            fallback = (
+                f"<#{default_id}>" if default_id is not None else "`/setup`"
+            )
+            await interaction.response.send_message(
+                f"**{label}** will now use this server's default channel "
+                f"({fallback}). Every other alert category is unchanged.",
+                ephemeral=True,
+            )
+            return
+
+        if channel.guild.id != guild.id:
+            await interaction.response.send_message(
+                "Choose a text channel from this server.", ephemeral=True
+            )
+            return
+
+        bot_member = guild.me
+        if bot_member is not None:
+            permissions = channel.permissions_for(bot_member)
+            if not permissions.send_messages or not permissions.embed_links:
+                await interaction.response.send_message(
+                    "I need permission to send messages and embed links in that "
+                    "channel.",
+                    ephemeral=True,
+                )
+                return
+
+        settings["channels"][alert] = channel.id
+        if not self.save_settings():
+            await interaction.response.send_message(
+                "I couldn't save this server's settings.", ephemeral=True
+            )
+            return
+        self.poll_wakeup.set()
+        await interaction.response.send_message(
+            f"**{label}** will now post to {channel.mention}. Every other alert "
+            "category is unchanged.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="set-news-alerts",
+        description="Send news alerts to their own channel in this server.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(
+        channel="Channel for news alerts; leave empty to use the default channel."
+    )
+    async def set_news_alerts_slash(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        await self.apply_alert_channel(interaction, "news", channel)
+
+    @app_commands.command(
+        name="set-price-alerts",
+        description="Send price-move alerts to their own channel in this server.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(
+        channel="Channel for price alerts; leave empty to use the default channel."
+    )
+    async def set_price_alerts_slash(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        await self.apply_alert_channel(interaction, "price", channel)
+
+    @app_commands.command(
+        name="set-new-markets",
+        description="Send new-market alerts to their own channel in this server.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(
+        channel="Channel for new markets; leave empty to use the default channel."
+    )
+    async def set_new_markets_slash(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        await self.apply_alert_channel(interaction, "new_market", channel)
+
+    @app_commands.command(
+        name="set-whale-alerts",
+        description="Send large-trade alerts to their own channel in this server.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(
+        channel="Channel for whale alerts; leave empty to use the default channel."
+    )
+    async def set_whale_alerts_slash(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        await self.apply_alert_channel(interaction, "whale", channel)
+
+    @app_commands.command(
+        name="config-check",
+        description="Check this server's alert channels and report anything broken.",
+    )
+    @app_commands.guild_only()
+    async def config_check_slash(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Run `/config-check` inside a Discord server.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        settings = self.get_settings(guild.id)
+        default_id = effective_channel_id(settings)
+        resolved: dict[int, tuple[bool, str]] = {}
+        problems: list[str] = []
+
+        async def describe(channel_id: int) -> tuple[bool, str]:
+            """Resolve one configured channel and say whether it is usable."""
+            cached = resolved.get(channel_id)
+            if cached is not None:
+                return cached
+            try:
+                channel = await self.resolve_channel(channel_id)
+            except discord.NotFound:
+                result = (False, f"<#{channel_id}> was deleted — configure it again")
+            except Exception:
+                result = (False, f"<#{channel_id}> could not be resolved")
+            else:
+                permissions = (
+                    channel.permissions_for(guild.me)
+                    if guild.me is not None
+                    else None
+                )
+                if channel.guild.id != guild.id:
+                    result = (
+                        False,
+                        f"<#{channel_id}> belongs to a different server",
+                    )
+                elif permissions is not None and (
+                    not permissions.send_messages or not permissions.embed_links
+                ):
+                    result = (
+                        False,
+                        f"<#{channel_id}> is missing the permission to send "
+                        "messages and embed links",
+                    )
+                else:
+                    result = (True, f"<#{channel_id}>")
+            resolved[channel_id] = result
+            return result
+
+        lines = ["**Alert channel check**"]
+        if default_id is None:
+            lines.append(
+                "**Default channel:** not configured — run `/setup` or one of the "
+                "`/set-` commands."
+            )
+            problems.append("No default alert channel is configured; run `/setup`.")
+        else:
+            ok, text = await describe(default_id)
+            lines.append(f"**Default channel:** {'✅' if ok else '⚠'} {text}")
+            if not ok:
+                problems.append(text)
+
+        channels = settings.get("channels")
+        for alert in ALERT_TYPES:
+            override = channels.get(alert) if isinstance(channels, dict) else None
+            channel_id = effective_channel_id(settings, alert)
+            if channel_id is None:
+                lines.append(
+                    f"**{ALERT_LABELS[alert]}** — ⚠ not configured · use "
+                    f"`{ALERT_CHANNEL_COMMANDS[alert]}`"
+                )
+                continue
+            ok, text = await describe(channel_id)
+            if not ok:
+                problems.append(text)
+            source = (
+                "this category has its own channel"
+                if override
+                else "using the default channel"
+            )
+            disabled = (
+                ""
+                if settings["alerts"].get(alert, True)
+                else " · (disabled)"
+            )
+            lines.append(
+                f"**{ALERT_LABELS[alert]}** — {'✅' if ok else '⚠'} {text} "
+                f"({source}){disabled} · "
+                f"`{ALERT_CHANNEL_COMMANDS[alert]}`"
+            )
+
+        if problems:
+            lines.append(f"⚠ {len(problems)} problem(s) found")
+        else:
+            lines.append("✅ Every configured channel is ready.")
+        await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
+
+    async def fetch_price_history(
+        self, token_id: str, interval: str
+    ) -> list[tuple[int, float]]:
+        """Fetch one market's price history at a readable resolution.
+
+        Each interval has an enforced minimum resolution, and a market that
+        is only a few hours old has too few points at the coarser one, so the
+        finer allowed resolution is tried before giving up.
+        """
+        candidates = CHART_FIDELITY_MINUTES.get(interval, (60,))
+        points: list[tuple[int, float]] = []
+        for fidelity in candidates:
+            payload = await self.get_json(
+                POLYMARKET_PRICE_HISTORY_URL,
+                params={
+                    "market": token_id,
+                    "interval": interval,
+                    "fidelity": fidelity,
+                },
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "LashNewsBot/1.0",
+                },
+                timeout=20,
+            )
+            points = parse_price_history(payload)
+            if len(points) >= 2:
+                break
+        return points
+
+    async def find_chart_market(self, query: str) -> dict[str, Any] | None:
+        """Resolve a market slug or a free-text query to one open market.
+
+        A query without spaces is treated as a slug: the exact lookup runs
+        first, and if Gamma does not know it the search results are accepted
+        only when a market slug matches exactly. That way a typo reports "not
+        found" instead of charting whatever the search returned first.
+        """
+        headers = {"Accept": "application/json", "User-Agent": "LashNewsBot/1.0"}
+        slug_like = " " not in query
+
+        if slug_like:
+            payload = await self.get_json(
+                POLYMARKET_MARKETS_URL,
+                params={
+                    "slug": query,
+                    "closed": "false",
+                    "active": "true",
+                    "limit": 5,
+                },
+                headers=headers,
+                timeout=15,
+            )
+            if isinstance(payload, list):
+                for market in payload:
+                    if isinstance(market, dict) and market.get("closed") is not True:
+                        return market
+
+        payload = await self.get_json(
+            POLYMARKET_SEARCH_URL,
+            params={
+                "q": query,
+                "events_status": "active",
+                "limit_per_type": 10,
+                "keep_closed_markets": 0,
+                "search_tags": "false",
+                "search_profiles": "false",
+            },
+            headers=headers,
+            timeout=15,
+        )
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("events"), list
+        ):
+            raise RuntimeError("Polymarket returned an unexpected search response.")
+
+        found: list[dict[str, Any]] = []
+        for event in payload["events"]:
+            if not isinstance(event, dict) or event.get("closed") is True:
+                continue
+            for market in event.get("markets") or []:
+                if isinstance(market, dict) and market.get("closed") is not True:
+                    found.append(market)
+        if not found:
+            return None
+        if slug_like:
+            for market in found:
+                if market.get("slug") == query:
+                    return market
+            return None
+        return found[0]
+
+    @app_commands.command(
+        name="chart",
+        description="Chart a Polymarket market's price history as a PNG.",
+    )
+    @app_commands.guild_only()
+    @app_commands.describe(
+        market="A market slug (for example brent-above-90) or a search phrase.",
+        days="How many days of history to chart (default 7).",
+    )
+    async def chart_slash(
+        self,
+        interaction: discord.Interaction,
+        market: str,
+        days: int = 7,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Run `/chart` inside a Discord server.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        query = clean_article_text(market)
+        if not query:
+            await interaction.followup.send(
+                "Give me a market slug or a search phrase.", ephemeral=True
+            )
+            return
+        try:
+            lookback = max(1, min(int(days), 365))
+        except (TypeError, ValueError):
+            lookback = 7
+
+        try:
+            found = await self.find_chart_market(query)
+        except Exception:
+            logger.exception("Could not look up a market for %r.", query)
+            await interaction.followup.send(
+                "Polymarket didn't answer the market lookup just now; try again in "
+                "a minute.",
+                ephemeral=True,
+            )
+            return
+        if found is None:
+            await interaction.followup.send(
+                f"I couldn't find a Polymarket market matching `{query}`. Try a "
+                "market slug or a shorter phrase.",
+                ephemeral=True,
+            )
+            return
+
+        token_id = first_clob_token_id(found)
+        if token_id is None:
+            await interaction.followup.send(
+                "That market has no price history available yet, so there is "
+                "nothing to chart.",
+                ephemeral=True,
+            )
+            return
+
+        interval = chart_interval(lookback)
+        try:
+            points = await self.fetch_price_history(token_id, interval)
+        except Exception:
+            logger.exception("Price history lookup failed for market %s.", token_id)
+            await interaction.followup.send(
+                "Polymarket didn't return price history for that market. Try again "
+                "in a minute.",
+                ephemeral=True,
+            )
+            return
+
+        if len(points) < 2:
+            await interaction.followup.send(
+                "There isn't enough price history for that market to draw a chart "
+                "yet.",
+                ephemeral=True,
+            )
+            return
+
+        question = clean_article_text(found.get("question")) or query
+        slug = clean_article_text(found.get("slug")) or query
+        outcomes = parse_outcomes(found)
+        outcome_label = outcomes[0] if outcomes else "Yes"
+        try:
+            png = render_price_chart(
+                question=question,
+                slug=slug,
+                outcome_label=outcome_label,
+                points=points,
+            )
+        except Exception:
+            logger.exception("Could not render a price chart for %s.", slug)
+            await interaction.followup.send(
+                "Chart rendering isn't available right now; the bot logs have the "
+                "details.",
+                ephemeral=True,
+            )
+            return
+
+        latest = points[-1][1]
+        first_price = points[0][1]
+        embed = discord.Embed(
+            title="Price history | Sovereign Predicts",
+            description=(
+                f"**{question[:350]}**\n\n"
+                f"[Open this market]({self.market_page_url(slug)}) · "
+                f"last {lookback} day(s) · {outcome_label} {latest:.1%} "
+                f"(from {first_price:.1%})"
+            ),
+            color=SOVEREIGN_COLOR,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_image(url="attachment://chart.png")
+        embed.set_footer(text="Market Intel • Sovereign Predicts")
+        await interaction.followup.send(
+            embed=embed,
+            file=discord.File(io.BytesIO(png), filename="chart.png"),
             ephemeral=True,
         )
 
@@ -2754,28 +3638,41 @@ class LashNewsBot(commands.Bot):
         ]
 
     async def run_monitor_cycle(self) -> None:
-        """Run every alert type once, isolating one failure from the rest."""
+        """Run every alert type once, isolating one failure from the rest.
+
+        Each category resolves its own destinations first, so a server that
+        only configured whale alerts never triggers a news or price fetch.
+        """
         if self.news_session is None:
             raise RuntimeError("The HTTP session is not available.")
 
-        destinations = await self.get_alert_channels()
-        if not destinations:
+        destinations_by_alert = await self.get_alert_destinations()
+        if not any(destinations_by_alert.values()):
             logger.warning(
                 "Monitoring is running but no alert channel is configured; "
-                "use /setup in a server."
+                "use /setup or /set-news-alerts in a server."
             )
             self.last_poll_at = datetime.now(timezone.utc)
             self.last_poll_error = None
             return
 
         subsystems = (
-            ("news", self.run_news_cycle),
-            ("new markets", self.run_new_market_cycle),
-            ("price moves", self.run_price_cycle),
-            ("large trades", self.run_whale_cycle),
+            ("news", "news", self.run_news_cycle),
+            ("new markets", "new_market", self.run_new_market_cycle),
+            ("price moves", "price", self.run_price_cycle),
+            ("large trades", "whale", self.run_whale_cycle),
         )
         failures: list[str] = []
-        for name, runner in subsystems:
+        attempted = 0
+        for name, alert, runner in subsystems:
+            destinations = destinations_by_alert.get(alert) or {}
+            if not destinations:
+                logger.debug(
+                    "Skipping the %s monitor: no channel is configured for it.",
+                    name,
+                )
+                continue
+            attempted += 1
             try:
                 await runner(destinations)
             except asyncio.CancelledError:
@@ -2786,9 +3683,10 @@ class LashNewsBot(commands.Bot):
 
         self.last_poll_at = datetime.now(timezone.utc)
         self.last_poll_error = "; ".join(failures)[:300] if failures else None
-        if len(failures) == len(subsystems):
-            # Every subsystem failed, so treat this as an outage and let the
-            # outer loop back off instead of hammering the APIs.
+        if attempted and len(failures) == attempted:
+            # Every subsystem that had a destination failed, so treat this as an
+            # outage and let the outer loop back off instead of hammering the
+            # APIs.
             raise RuntimeError(self.last_poll_error)
 
     def guild_accepts_article(self, guild_id: str, article: dict[str, Any]) -> bool:
@@ -2830,6 +3728,11 @@ class LashNewsBot(commands.Bot):
         self,
         destinations: dict[str, discord.TextChannel | discord.Thread],
     ) -> None:
+        if not getattr(self, "news_api_keys", None):
+            logger.debug(
+                "Skipping the news monitor: no NewsAPI key is configured."
+            )
+            return
         if self.news_session is None:
             raise RuntimeError("The HTTP session is not available.")
 
@@ -2967,7 +3870,7 @@ class LashNewsBot(commands.Bot):
                 f"**{question[:350]}**\n\n"
                 f"[Open this market]({self.market_page_url(market.get('slug'))})"
             ),
-            color=discord.Color.from_rgb(198, 161, 91),
+            color=SOVEREIGN_COLOR,
             timestamp=datetime.now(timezone.utc),
         )
         embed.add_field(name="Liquidity", value=f"${liquidity:,.0f}", inline=True)
@@ -3055,7 +3958,7 @@ class LashNewsBot(commands.Bot):
                 f"**{side} {outcome}** on {title[:250]}\n\n"
                 f"[Open this market]({self.market_page_url(trade.get('slug'))})"
             ),
-            color=discord.Color.from_rgb(198, 161, 91),
+            color=WHALE_SELL_COLOR if side == "SELL" else WHALE_BUY_COLOR,
             timestamp=occurred_at,
         )
         embed.add_field(name="Value", value=f"${notional:,.0f}", inline=True)
@@ -3412,9 +4315,13 @@ class LashNewsBot(commands.Bot):
         is built on demand so the session can be injected and swapped in tests.
         """
         if not hasattr(self, "_cached_news_provider"):
+            keys = list(getattr(self, "news_api_keys", None) or [])
+            if not keys and self.news_api_key:
+                keys = [self.news_api_key]
             self._cached_news_provider = build_news_provider(
                 self,
-                api_key=self.news_api_key,
+                api_key=keys[0] if keys else "",
+                api_keys=keys,
                 provider_name=os.getenv("NEWS_SOURCE", DEFAULT_NEWS_SOURCE_NAME),
             )
         return self._cached_news_provider
@@ -3596,7 +4503,7 @@ class LashNewsBot(commands.Bot):
                 f"**News**\n[{source_name} — {url}]({url})\n\n"
                 f"**Link**\n[Read Article]({url})"
             ),
-            color=discord.Color.from_rgb(59, 130, 246),
+            color=SOVEREIGN_COLOR,
             timestamp=published_at or datetime.now(timezone.utc),
         )
 
@@ -3656,6 +4563,7 @@ class LashNewsBot(commands.Bot):
             f"**Discord connection:** {'connected' if self.is_ready() else 'disconnected'}",
             f"**News monitoring:** {'running' if monitor_running else 'stopped'}",
             f"**Destination:** {destination}",
+            f"**News provider:** {'NewsAPI' if self.news_api_keys else 'not set'}",
             "**Discovery:** active Polymarket market questions",
             f"**Markets searched:** {self.last_market_count}",
             "**Posting filter:** article must match an active market",
@@ -3669,11 +4577,18 @@ class LashNewsBot(commands.Bot):
 
 def create_bot() -> LashNewsBot:
     token = os.getenv("DISCORD_BOT_TOKEN")
-    news_api_key = os.getenv("NEWS_API_KEY")
+    news_api_key = os.getenv("NEWS_API_KEY") or ""
     if not token:
         raise ValueError("DISCORD_BOT_TOKEN is required.")
     if not news_api_key:
-        raise ValueError("NEWS_API_KEY is required.")
+        # News alerts need a NewsAPI key, but price, new-market, and whale
+        # alerts do not. A missing key degrades one category instead of
+        # refusing to boot, which on a host like Railway is a crash loop.
+        logger.warning(
+            "NEWS_API_KEY is not set, so market-matched news is disabled. "
+            "Price, new-market, and whale alerts are unaffected; set "
+            "NEWS_API_KEY (or NEWS_API_KEYS) to enable news."
+        )
 
     try:
         poll_interval = int(os.getenv("NEWS_POLL_INTERVAL_SECONDS", "300"))

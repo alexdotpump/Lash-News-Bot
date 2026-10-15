@@ -22,14 +22,23 @@ import main  # noqa: E402
 EXPECTED_COMMANDS = {
     "setup", "alerts", "status", "test", "sources", "keywords", "help",
     "servers", "server-info", "sync",
+    # Per-category channel configuration.
+    "set-news-alerts", "set-price-alerts", "set-new-markets", "set-whale-alerts",
+    # Diagnostics and charting.
+    "config-check", "chart",
 }
 # Commands that must be restricted to servers (not usable in DMs).
 GUILD_ONLY = {
     "setup", "alerts", "status", "test", "sources", "keywords",
     "sync", "server-info",
+    "set-news-alerts", "set-price-alerts", "set-new-markets", "set-whale-alerts",
+    "config-check", "chart",
 }
 # Commands that only server administrators may run by default.
-ADMIN_ONLY = {"setup", "alerts", "sources", "keywords"}
+ADMIN_ONLY = {
+    "setup", "alerts", "sources", "keywords",
+    "set-news-alerts", "set-price-alerts", "set-new-markets", "set-whale-alerts",
+}
 
 
 class FakeResponse:

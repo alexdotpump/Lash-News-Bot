@@ -41,6 +41,7 @@ class DefaultSettingsTests(SettingsStateTestCase):
             set(settings),
             {
                 "channel_id",
+                "channels",
                 "include_keywords",
                 "exclude_keywords",
                 "sources",
@@ -52,6 +53,9 @@ class DefaultSettingsTests(SettingsStateTestCase):
         )
         self.assertEqual(set(settings["alerts"]), set(main.ALERT_TYPES))
         self.assertTrue(all(settings["alerts"].values()))
+        # Every alert category starts with its own unset channel override.
+        self.assertEqual(set(settings["channels"]), set(main.ALERT_TYPES))
+        self.assertTrue(all(value is None for value in settings["channels"].values()))
 
     def test_normalize_rejects_garbage_and_clamps_numbers(self):
         normalized = main.normalize_guild_settings(
