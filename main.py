@@ -951,9 +951,9 @@ def _score_relationship(
 
     # Base by classification.
     if relationship == "Direct":
-        score += 60
+        score += 67
     elif relationship == "Strong indirect":
-        score += 50
+        score += 58
     else:
         score += 15
 
@@ -997,7 +997,7 @@ def _score_relationship(
 
     # Staleness penalty.
     if published_at and _is_stale_article(published_at):
-        score -= 15
+        score -= 8
 
     # Clarity/specificity penalty.
     if _is_ambiguous_or_generative(headline, summary, parsed_market):
@@ -1092,10 +1092,23 @@ def _is_ambiguous_or_generative(headline: str, summary: str, parsed_market: dict
     article_entities = extract_named_entities(combined)
     if not article_entities:
         return False
+
+    # If the article reports a concrete development (a word like "hike", "deal",
+    # "approve", "raise") it is describing the kind of event the market resolves on,
+    # so a named-entity name mismatch alone should not mark it as ambiguous.
+    article_terms = meaningful_market_terms(combined)
+    if article_terms & DEVELOPMENT_SIGNAL_TERMS:
+        return False
+
+    # The same exemption also applies when the article shares a development-signal
+    # term with the market question itself.
+    question_term_overlap = article_terms & meaningful_market_terms(parsed_market["question"])
+    if question_term_overlap & DEVELOPMENT_SIGNAL_TERMS:
+        return False
+
     if len(article_entities & parsed_market["entities"]) == 0:
         return True
     return False
-
 
 def _relationship_explanation_components(
     *,
