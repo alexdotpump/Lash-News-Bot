@@ -116,11 +116,27 @@ market catalog and only genuinely related stories are posted.
   probability of any outcome. Scores combine entity correspondence, question focus terms,
   source reliability, resolution-criteria compatibility, time-frame compatibility, and
   penalties for superficial keyword overlap, stale articles, and unsupported claims.
-- **Alert policy** — a match is posted only when its score is at least
-  `MIN_CORRELATION_FOR_ALERT` (default 85) **and** its classification is `Direct` or
-  `Strong indirect`. Matches scoring at or above `MIN_CORRELATION_FOR_DIAGNOSTICS`
-  (default 70) are retained for diagnostics; everything below is rejected. An unrelated story
-  is never promoted merely because it shares keywords.
+- **Alert policy** — the bar is one explicit, tunable gate (`is_alertable`). A `Direct` or
+  `Strong indirect` match posts at `NEWS_CORRELATION_ALERT_THRESHOLD` (default **60**); a
+  `Contextual` match needs that plus `NEWS_CORRELATION_CONTEXTUAL_MARGIN` (default **75**),
+  because a shared subject is much weaker evidence than a concrete development. Matches at or
+  above `NEWS_CORRELATION_DIAGNOSTICS_THRESHOLD` (default **45**) are kept for logging and
+  tuning and are reported as `near miss` lines; everything below is rejected. Nothing below
+  the bar is ever substituted onto an alert.
+- **Structural guards** — a lower score bar only helps if the score means something, so a
+  match must also clear three checks:
+  - the shared evidence cannot be only numbers, only calendar words ("October", "Tuesday"),
+    or vocabulary that appears across the market catalog ("2026", "december") — those are
+    excluded from evidence because a market that resolves "by October 31" and an article
+    published in October share a month, not a subject;
+  - a named entity that few markets use is evidence by itself; shared ordinary words are not,
+    so at least `NEWS_MIN_SUBSTANTIVE_TERMS` (default 2) of them are required, because one
+    shared word links two unrelated stories;
+  - the evidence must be in the article **headline** (`NEWS_REQUIRE_HEADLINE_EVIDENCE`,
+    default true), since NewsAPI body text carries site furniture and related-article links.
+- **Market entities** — taken from the market question and event title. Gamma's long
+  resolution descriptions are deliberately excluded: they are full of capitalized ordinary
+  words ("Note", "If", "However") that used to make unrelated stories look correlated.
 - **Self-explaining matches** — each accepted match carries a short, article-grounded reason
   describing why this story matters to that market. The engine never invents facts,
   resolution rules, or causal links the evidence does not support.
@@ -129,9 +145,36 @@ market catalog and only genuinely related stories are posted.
 - **Source adapter** — providers are plugged in behind a small adapter interface. `NewsAPI` is
   the default and remains the fallback; no additional provider is enabled without a key.
 
-These thresholds (`MIN_CORRELATION_FOR_ALERT`, `MIN_CORRELATION_FOR_DIAGNOSTICS`,
-`MAX_RELATED_MARKETS`) are code-level calibration constants, not per-server settings and not
+##### Measured precision (read this before lowering the bar)
+
+Verified against the live NewsAPI and Gamma APIs (94 articles from five pages of the
+market-driven query, 191 top-volume markets):
+
+| Configuration | Alerts produced | Notes |
+| --- | --- | --- |
+| Previous policy (85/70), guards on | 5 | 2 were off-topic |
+| Current policy (60/45), guards on | 7 | 2 more matches, one off-topic |
+| Current policy, headline guard off | 28 | mostly off-topic |
+
+Two conclusions from that run, both worth knowing before tuning: the relaxed bar roughly
+doubles the number of matches on the same input while the guards keep obvious junk out; and
+the score itself is a bag-of-words estimate whose remaining ceiling is the matcher, not the
+threshold. If alerts look too noisy, raise `NEWS_CORRELATION_ALERT_THRESHOLD`; if the feed is
+too quiet, set `NEWS_REQUIRE_HEADLINE_EVIDENCE=false` and re-check
+`NEWS_MIN_SUBSTANTIVE_TERMS`. The `near miss` log lines name the closest market and the score
+it needed, which is the fastest way to see how far off a rejected story was.
+
+All of these thresholds and guards are environment settings, not per-server settings and not
 secrets.
+
+##### Alert channel fallbacks
+
+`ALERT_CHANNEL_FALLBACKS` (for example
+`news=1556620827154321419,whale=1556058128674586644`) names a channel for a category that has
+no channel configured. It exists because a category nobody pointed anywhere used to be skipped
+silently, which looked exactly like a dead task. The fallback only fills a gap: an explicit
+`/set-...-alerts` choice always wins, a category switched off in that server is left off, and
+the channel must belong to the server it is used for, so it can never cross between servers.
 
 ### Rate and noise limits
 

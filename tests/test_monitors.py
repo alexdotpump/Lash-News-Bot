@@ -74,6 +74,99 @@ class FakeChannel:
         self.mention = f"<#{channel_id}>"
 
 
+
+class _FallbackGuild:
+    def __init__(self, guild_id: int) -> None:
+        self.id = guild_id
+
+
+class _FallbackChannel:
+    def __init__(self, channel_id: int, guild_id: int) -> None:
+        self.id = channel_id
+        self.guild = _FallbackGuild(guild_id)
+        self.mention = f"<#{channel_id}>"
+
+
+class AlertChannelFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """The configured fallback boots a category nobody pointed anywhere.
+
+    It exists for the case that actually happened in production: a category had
+    no channel, so the monitor skipped it silently and the alerts looked dead.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._cwd = os.getcwd()
+        os.chdir(self._tmp.name)
+        self._original = dict(main.ALERT_CHANNEL_FALLBACKS)
+
+    def tearDown(self) -> None:
+        main.ALERT_CHANNEL_FALLBACKS.clear()
+        main.ALERT_CHANNEL_FALLBACKS.update(self._original)
+        os.chdir(self._cwd)
+        self._tmp.cleanup()
+
+    async def _bot(self, guild_ids, channel, *, alerts=None):
+        bot = main.create_bot()
+
+        async def no_sync(guild=None):
+            return []
+
+        bot.tree.sync = no_sync
+        # Bot.guilds is a read-only view over the connection state.
+        bot._connection._guilds = {
+            guild_id: _FallbackGuild(guild_id) for guild_id in guild_ids
+        }
+
+        async def resolve(channel_id):
+            if channel is not None and channel_id == channel.id:
+                return channel
+            raise RuntimeError(f"channel {channel_id} is not available")
+
+        bot.resolve_channel = resolve
+        for guild_id in guild_ids:
+            settings = bot.ensure_settings(guild_id)
+            if alerts is not None:
+                settings["alerts"].update(alerts)
+        self.addAsyncCleanup(bot.close)
+        return bot
+
+    async def test_fallback_fills_a_category_the_server_never_configured(self):
+        channel = _FallbackChannel(9001, 1)
+        bot = await self._bot([1], channel)
+        main.ALERT_CHANNEL_FALLBACKS["news"] = 9001
+        destinations = await bot.get_alert_channels("news")
+        self.assertEqual(set(destinations), {"1"})
+        self.assertIs(destinations["1"], channel)
+
+    async def test_an_explicit_choice_is_never_overridden(self):
+        channel = _FallbackChannel(9001, 1)
+        bot = await self._bot([1], channel)
+        chosen = _FallbackChannel(9002, 1)
+        bot.get_settings("1")["channels"]["news"] = 9002
+        bot.resolve_channel = lambda channel_id: asyncio.sleep(0, result=chosen)
+        main.ALERT_CHANNEL_FALLBACKS["news"] = 9001
+        destinations = await bot.get_alert_channels("news")
+        self.assertIs(destinations["1"], chosen)
+
+    async def test_a_category_switched_off_in_that_server_is_respected(self):
+        channel = _FallbackChannel(9001, 1)
+        bot = await self._bot([1], channel, alerts={"news": False})
+        main.ALERT_CHANNEL_FALLBACKS["news"] = 9001
+        self.assertEqual(await bot.get_alert_channels("news"), {})
+
+    async def test_the_fallback_never_crosses_into_another_server(self):
+        # The fallback channel belongs to server 2, so server 1 must not get it.
+        channel = _FallbackChannel(9001, 2)
+        bot = await self._bot([1], channel)
+        main.ALERT_CHANNEL_FALLBACKS["news"] = 9001
+        self.assertEqual(await bot.get_alert_channels("news"), {})
+
+    async def test_no_fallback_configured_means_no_destination(self):
+        bot = await self._bot([1], None)
+        main.ALERT_CHANNEL_FALLBACKS.clear()
+        self.assertEqual(await bot.get_alert_channels("news"), {})
+
 class MonitorTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

@@ -9,12 +9,15 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
 os.environ.setdefault("DISCORD_BOT_TOKEN", "dummy.token.value")
 os.environ.setdefault("NEWS_API_KEY", "dummy-news-key")
+
+from unittest import mock  # noqa: E402
 
 import discord  # noqa: E402
 
@@ -68,6 +71,18 @@ def market(
 
 
 # Fixtures -------------------------------------------------------------------
+
+def fresh_stamp(hours_ago: int = 1) -> str:
+    """An ISO publication stamp inside the 72-hour staleness window.
+
+    The score fixtures are deliberately old stories, so a test that measures the
+    staleness penalty has to compare against a genuinely fresh publication stamp
+    rather than against another stale one.
+    """
+    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
 
 UKRAINE_ARTICLE = dict(
     title="Ukraine's energy minister announces a new crude supply deal",
@@ -236,10 +251,16 @@ class CorrelationUnitTests(unittest.TestCase):
             main.compute_correlation(article(**BRENT_ARTICLE), market(**BRENT_MARKET))
         )
 
-    def test_past_deadline_is_not_alertable(self):
+    def test_past_deadline_is_penalized_against_a_live_market(self):
         past = dict(BRENT_MARKET, endDate="2024-12-31T00:00:00Z")
-        match = main.compute_correlation(article(**BRENT_ARTICLE), market(**past))
-        self.assertTrue(match is None or match.score < main.MIN_CORRELATION_FOR_ALERT)
+        past_match = main.compute_correlation(article(**BRENT_ARTICLE), market(**past))
+        live_match = main.compute_correlation(
+            article(**BRENT_ARTICLE), market(**BRENT_MARKET)
+        )
+        # A market whose window closed long before the story ran is scored
+        # exactly the documented timeframe penalty below the live-market match.
+        self.assertIsNotNone(past_match)
+        self.assertEqual(live_match.score - past_match.score, 8)
 
 
 class CorrelationScoreBoundaryTests(unittest.TestCase):
@@ -292,16 +313,27 @@ class SourceHandlingTests(unittest.TestCase):
 
 
 class TimestampAndStalenessTests(unittest.TestCase):
-    def test_stale_article_is_not_alertable(self):
+    def test_stale_article_scores_below_the_same_story_published_today(self):
         stale = dict(BRENT_ARTICLE, published_at="2018-01-01T00:00:00Z")
-        match = main.compute_correlation(article(**stale), market(**BRENT_MARKET))
-        self.assertTrue(match is None or match.score < main.MIN_CORRELATION_FOR_ALERT)
+        fresh = dict(BRENT_ARTICLE, published_at=fresh_stamp())
+        stale_match = main.compute_correlation(article(**stale), market(**BRENT_MARKET))
+        fresh_match = main.compute_correlation(article(**fresh), market(**BRENT_MARKET))
+        self.assertIsNotNone(stale_match)
+        # Staleness is worth -8 past the 72-hour cut.
+        self.assertEqual(fresh_match.score - stale_match.score, 8)
 
     def test_unknown_publication_time_is_a_mild_penalty(self):
         unknown = dict(BRENT_ARTICLE, published_at=None)
-        match = main.compute_correlation(article(**unknown), market(**BRENT_MARKET))
-        self.assertIsNotNone(match)
-        self.assertLess(match.score, main.MIN_CORRELATION_FOR_ALERT)
+        known = dict(BRENT_ARTICLE, published_at=fresh_stamp())
+        unknown_match = main.compute_correlation(
+            article(**unknown), market(**BRENT_MARKET)
+        )
+        known_match = main.compute_correlation(
+            article(**known), market(**BRENT_MARKET)
+        )
+        self.assertIsNotNone(unknown_match)
+        # -5: deliberately milder than the staleness penalty.
+        self.assertEqual(known_match.score - unknown_match.score, 5)
 
     def test_published_at_is_used_not_fetch_time(self):
         self.assertIsNotNone(
@@ -390,20 +422,48 @@ class EmbedFormatTests(unittest.TestCase):
         self.assertIn("Summary", [f.name for f in embed.fields])
         self.assertIn("Related Markets", [f.name for f in embed.fields])
 
-    def test_related_markets_shows_question_url_and_score(self):
+    def test_related_markets_shows_question_url_score_and_price(self):
         art = article(**dict(UKRAINE_ARTICLE, url="https://example.test/article"))
         match = main.compute_correlation(art, market(**UKRAINE_MARKET))
         self.assertIsNotNone(match)
         embed = self.bot.make_news_embed(art, [match])
         related_field = next(f.value for f in embed.fields if f.name == "Related Markets")
-        self.assertIn("Correlation:", related_field)
+        self.assertIn("correlation:", related_field)
         self.assertIn("Polymarket", related_field)
         self.assertIn("ukraine-crude-deal", related_field)
+        # "| $0.55 (correlation: N%)", as in the reference design.
+        self.assertRegex(related_field, r"\| \$0\.55 \(correlation: \d+%\)")
 
-    def test_footer_has_publisher_and_timestamp_attribution(self):
+    def test_embed_matches_the_reference_layout(self):
+        art = article(**dict(UKRAINE_ARTICLE, url="https://example.test/article"))
+        embed = self.bot.make_news_embed(art, [])
+        self.assertEqual(embed.title, "Market Intel | Sovereign Predicts")
+        self.assertEqual(embed.url, "https://example.test/article")
+        self.assertIn(
+            "**News:** [Reuters] Ukraine's energy minister announces",
+            embed.description,
+        )
+        self.assertIn(
+            "**Link:** [Read Article](https://example.test/article)",
+            embed.description,
+        )
+        self.assertEqual(embed.color, main.SOVEREIGN_COLOR)
+        self.assertEqual(
+            [field.name for field in embed.fields], ["Summary", "Related Markets"]
+        )
+
+    def test_footer_has_generator_attribution_and_publication_stamp(self):
         embed = self.bot.make_news_embed(article(**UKRAINE_ARTICLE), [])
-        self.assertIn("Reuters", embed.footer.text)
-        self.assertIn("Sovereign Predicts", embed.footer.text)
+        self.assertTrue(
+            embed.footer.text.startswith("Generated by Sovereign Predicts | ")
+        )
+        self.assertNotIn("publication time unknown", embed.footer.text)
+        # The publisher is named on the News line rather than in the footer.
+        self.assertIn("[Reuters]", embed.description)
+
+    def test_footer_says_so_when_the_publication_time_is_unknown(self):
+        embed = self.bot.make_news_embed(article(published_at=None), [])
+        self.assertIn("publication time unknown", embed.footer.text)
 
     def test_no_political_alignment_field_exists(self):
         embed = self.bot.make_news_embed(article(**UKRAINE_ARTICLE), [])
@@ -459,8 +519,9 @@ class EmbedFormatTests(unittest.TestCase):
                 market=market(
                     question=(
                         f"Will Brent crude settle above {level} dollars before "
-                        "December 31?"
-                    ),
+                        "December 31? "
+                    )
+                    * 5,
                     slug=f"brent-{level}",
                 ),
                 score=90,
@@ -493,6 +554,77 @@ class EmbedFormatTests(unittest.TestCase):
         self.assertEqual(len(embed.author.name), main.EMBED_AUTHOR_LIMIT)
         self.assertTrue(embed.fields[0].value.endswith("\u2026"))
         self.assertEqual(len(embed.fields[0].name), main.EMBED_FIELD_NAME_LIMIT)
+
+
+class NewsPolicyTests(unittest.TestCase):
+    """The posting policy is env-tunable and its defaults are the balanced set."""
+
+    def test_default_thresholds_are_in_range_and_ordered(self):
+        for value in (
+            main.MIN_CORRELATION_FOR_ALERT,
+            main.MIN_CORRELATION_FOR_DIAGNOSTICS,
+            main.CONTEXTUAL_ALERT_MARGIN,
+        ):
+            self.assertIsInstance(value, int)
+            self.assertGreaterEqual(value, 0)
+            self.assertLessEqual(value, 100)
+        self.assertLessEqual(
+            main.MIN_CORRELATION_FOR_DIAGNOSTICS, main.MIN_CORRELATION_FOR_ALERT
+        )
+
+    def test_strong_relationships_need_the_alert_threshold(self):
+        bar = main.MIN_CORRELATION_FOR_ALERT
+        self.assertFalse(main.is_alertable("Direct", bar - 1))
+        self.assertTrue(main.is_alertable("Direct", bar))
+        self.assertFalse(main.is_alertable("Strong indirect", bar - 1))
+        self.assertTrue(main.is_alertable("Strong indirect", bar))
+
+    def test_contextual_matches_need_the_higher_bar(self):
+        contextual_bar = main.MIN_CORRELATION_FOR_ALERT + main.CONTEXTUAL_ALERT_MARGIN
+        self.assertEqual(main.required_score("Contextual"), contextual_bar)
+        self.assertGreaterEqual(
+            contextual_bar, main.MIN_CORRELATION_FOR_ALERT
+        )
+        self.assertFalse(main.is_alertable("Contextual", contextual_bar - 1))
+        self.assertTrue(main.is_alertable("Contextual", contextual_bar))
+
+    def test_unrelated_matches_are_never_postable(self):
+        self.assertIsNone(main.required_score("Unrelated"))
+        self.assertFalse(main.is_alertable("Unrelated", 100))
+
+    def test_alert_threshold_override_is_read_from_the_environment(self):
+        with mock.patch.dict(
+            os.environ, {"NEWS_CORRELATION_ALERT_THRESHOLD": "80"}
+        ):
+            self.assertEqual(
+                main._env_int("NEWS_CORRELATION_ALERT_THRESHOLD", 60, 1, 100), 80
+            )
+        # Out-of-range values are clamped rather than trusted.
+        with mock.patch.dict(
+            os.environ, {"NEWS_CORRELATION_ALERT_THRESHOLD": "0"}
+        ):
+            self.assertEqual(
+                main._env_int("NEWS_CORRELATION_ALERT_THRESHOLD", 60, 1, 100), 1
+            )
+
+    def test_a_bad_threshold_override_warns_and_keeps_the_default(self):
+        with mock.patch.dict(
+            os.environ, {"NEWS_CORRELATION_ALERT_THRESHOLD": "strict-please"}
+        ):
+            with self.assertLogs("lash-news-bot", level="WARNING") as logs:
+                value = main._env_int("NEWS_CORRELATION_ALERT_THRESHOLD", 60, 1, 100)
+        self.assertEqual(value, 60)
+        self.assertIn("whole number", "\n".join(logs.output))
+
+    def test_fallback_channels_parse_safely(self):
+        self.assertEqual(
+            main.parse_alert_channel_fallbacks("news=123,whale=456;price=789"),
+            {"news": 123, "whale": 456, "price": 789},
+        )
+        # Unknown categories, junk ids, blanks and zero are all dropped.
+        self.assertEqual(
+            main.parse_alert_channel_fallbacks("bogus=1,news=abc,,whale=0,news="), {}
+        )
 
 
 class ProviderAndFailureTests(unittest.TestCase):
@@ -536,11 +668,26 @@ class DiagnosticsAndRejectionLoggingTests(unittest.TestCase):
             main.compute_correlation(article(**APPLE_ARTICLE), market(**APPLE_MARKET))
         )
 
-    def test_diagnostic_threshold_exposes_mid_range_matches(self):
+    def test_diagnostics_floor_is_a_separate_lower_bar(self):
+        # The scorer keeps plausible-but-weak matches so they can be logged and
+        # tuned; the posting gate stays stricter than that floor.
+        self.assertLess(
+            main.MIN_CORRELATION_FOR_DIAGNOSTICS, main.MIN_CORRELATION_FOR_ALERT
+        )
         match = main.compute_correlation(article(**BRENT_ARTICLE), market(**BRENT_MARKET))
         self.assertIsNotNone(match)
         self.assertGreaterEqual(match.score, main.MIN_CORRELATION_FOR_DIAGNOSTICS)
-        self.assertLess(match.score, main.MIN_CORRELATION_FOR_ALERT)
+
+    def test_below_bar_match_is_never_substituted_onto_an_alert(self):
+        mid_band = main.MarketMatch(
+            market=market(**BRENT_MARKET),
+            score=main.MIN_CORRELATION_FOR_ALERT - 1,
+            relationship="Direct",
+            explanation="Close, but below the configured bar.",
+            why_short="",
+        )
+        self.assertFalse(main.is_alertable(mid_band.relationship, mid_band.score))
+        self.assertEqual(main.select_polymarket_market([mid_band]), [])
 
     def test_direct_match_is_alertable(self):
         match = main.compute_correlation(article(**UKRAINE_ARTICLE), market(**UKRAINE_MARKET))
@@ -655,7 +802,7 @@ class NewsCycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         _, embed = self.posts[0]
         self.assertEqual(embed.title, "Market Intel | Sovereign Predicts")
         related = next(f.value for f in embed.fields if f.name == "Related Markets")
-        self.assertIn("Correlation:", related)
+        self.assertIn("correlation:", related)
         self.assertIn("ukraine-crude-deal", related)
 
     async def test_syndicated_duplicate_posts_only_once(self):
@@ -667,6 +814,19 @@ class NewsCycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         await bot.run_news_cycle({"1": FakeChannel()})
         self.assertEqual(len(self.posts), 1, "a syndicated copy must not post twice")
+
+    async def test_below_bar_article_does_not_post_and_is_logged(self):
+        relevant = article(**dict(UKRAINE_ARTICLE, url="https://example.test/ukraine"))
+        bot = await self._bot(
+            articles=[relevant], markets=[market(**UKRAINE_MARKET)]
+        )
+        with mock.patch.object(main, "MIN_CORRELATION_FOR_ALERT", 100):
+            with self.assertLogs("lash-news-bot", level="INFO") as logs:
+                await bot.run_news_cycle({"1": FakeChannel()})
+        self.assertEqual(self.posts, [], "a below-bar match must not alert")
+        self.assertIn(
+            "No market cleared the alert bar", "\n".join(logs.output)
+        )
 
     async def test_irrelevant_article_produces_no_post(self):
         bot = await self._bot(
@@ -710,7 +870,7 @@ class NewsCycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             for field in channel.sent_embeds[0].fields
             if field.name == "Related Markets"
         )
-        self.assertIn("Correlation:", related)
+        self.assertIn("correlation:", related)
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import signal
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,10 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+# Defined before the configuration constants below, which validate their
+# environment overrides and warn through this logger at import time.
+logger = logging.getLogger("lash-news-bot")
 
 NEWS_API_URL = "https://newsapi.org/v2/everything"
 POLYMARKET_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
@@ -128,6 +133,46 @@ ALERT_CHANNEL_COMMANDS = {
 }
 
 
+def parse_alert_channel_fallbacks(raw: str | None) -> dict[str, int]:
+    """Parse ``ALERT_CHANNEL_FALLBACKS`` into ``{category: channel_id}``.
+
+    Format: ``news=1234567890,whale=987654321`` (commas or semicolons). Unknown
+    category names, blanks, and non-numeric ids are ignored so a typo can never
+    send an alert to an unintended channel.
+    """
+    fallbacks: dict[str, int] = {}
+    for chunk in re.split(r"[,;]", raw or ""):
+        name, separator, value = chunk.partition("=")
+        name = name.strip().lower()
+        value = value.strip()
+        if not separator or name not in ALERT_TYPES or not value:
+            continue
+        try:
+            channel_id = int(value)
+        except ValueError:
+            logger.warning(
+                "Ignoring ALERT_CHANNEL_FALLBACKS entry %r: %r is not a channel id.",
+                chunk.strip(),
+                value,
+            )
+            continue
+        if channel_id > 0:
+            fallbacks[name] = channel_id
+    return fallbacks
+
+
+# Optional server-side bootstrap for a category nobody has pointed at a channel
+# yet. It only ever fills a gap in a server that already receives some alerts.
+ALERT_CHANNEL_FALLBACKS = parse_alert_channel_fallbacks(os.getenv("ALERT_CHANNEL_FALLBACKS"))
+
+
+def alert_fallback_channel_id(alert: str | None) -> int | None:
+    """The configured bootstrap channel for one alert category, if any."""
+    if not alert:
+        return None
+    return ALERT_CHANNEL_FALLBACKS.get(alert)
+
+
 class _RetryableRequestError(RuntimeError):
     """A temporary upstream failure (429/5xx) that is safe to retry."""
 
@@ -147,14 +192,65 @@ OWNER_ID = 1549940496607088670
 # validated probability. They are meant to be tuned against real alerts and
 # rejected examples before any claim of calibration is made.
 #
-# A match is postable by default only when both conditions hold:
-#   * correlation >= MIN_CORRELATION_FOR_ALERT
-#   * relationship is Direct or Strong indirect
+# The policy is tunable through the environment because "strict enough" is an
+# editorial decision: a server that wants a quiet feed and a server that wants
+# every plausible story are both legitimate. The defaults are the balanced
+# setting -- a story with a clear, explainable link to a market posts; a story
+# that only shares a subject needs a considerably higher score.
 #
-# Matches in the 70-84 band are retained for diagnostics but are not sent
-# automatically under the default policy.
-MIN_CORRELATION_FOR_ALERT = 85
-MIN_CORRELATION_FOR_DIAGNOSTICS = 70
+#   * Direct / Strong indirect: score >= NEWS_CORRELATION_ALERT_THRESHOLD
+#   * Contextual:               score >= that threshold + NEWS_CORRELATION_CONTEXTUAL_MARGIN
+#
+# Matches at or above the diagnostics floor are kept for tuning and logging but
+# are not posted unless they also clear the bar above.
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    """Read an integer override from the environment, clamped into range."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s must be a whole number; using the default %d.", name, default
+        )
+        return default
+    return max(low, min(high, value))
+
+
+MIN_CORRELATION_FOR_ALERT = _env_int("NEWS_CORRELATION_ALERT_THRESHOLD", 60, 1, 100)
+MIN_CORRELATION_FOR_DIAGNOSTICS = _env_int(
+    "NEWS_CORRELATION_DIAGNOSTICS_THRESHOLD", 45, 1, 100
+)
+# A contextual match has no concrete development behind it, so it must clear a
+# noticeably higher bar than a direct one before it is allowed to post.
+CONTEXTUAL_ALERT_MARGIN = _env_int("NEWS_CORRELATION_CONTEXTUAL_MARGIN", 15, 0, 100)
+# Two structural guards keep the relaxed bar from turning into noise. Both are
+# tunable because the right setting depends on how much a server wants to see:
+#   NEWS_MIN_SUBSTANTIVE_TERMS: how many shared non-numeric, non-catalog-wide
+#       terms count as a link when no named entity is shared. One shared ordinary
+#       word ("strike", "post", "eagles") links two unrelated stories, so 2 is
+#       the default.
+#   NEWS_REQUIRE_HEADLINE_EVIDENCE: require that evidence to be in the headline.
+#       NewsAPI's body text carries site furniture and related-article links, so
+#       without this a printer launch matched a football market.
+MIN_SUBSTANTIVE_TERMS = _env_int("NEWS_MIN_SUBSTANTIVE_TERMS", 2, 1, 10)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean override from the environment."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().casefold() in {"1", "true", "yes", "on"}
+
+
+REQUIRE_HEADLINE_EVIDENCE = _env_flag("NEWS_REQUIRE_HEADLINE_EVIDENCE", True)
+# The diagnostics floor is only useful below the alert bar; keep it consistent
+# even if the environment sets them the wrong way round.
+MIN_CORRELATION_FOR_DIAGNOSTICS = min(
+    MIN_CORRELATION_FOR_DIAGNOSTICS, MIN_CORRELATION_FOR_ALERT
+)
 MAX_RELATED_MARKETS = 3
 
 # Discord's hard embed limits. Exceeding any of them rejects the whole message
@@ -331,8 +427,39 @@ class MarketMatch:
 
 
 def classify_relationship(relationship: str) -> bool:
-    """Return True when this relationship is eligible for a public alert."""
+    """Return True when this relationship is a direct, defensible link.
+
+    This describes the relationship itself. Whether the configured policy may
+    post it is decided by :func:`is_alertable`, which is the only posting gate.
+    """
     return relationship in {"Direct", "Strong indirect"}
+
+
+def required_score(relationship: str) -> int | None:
+    """The score a match of this relationship must reach to be posted.
+
+    Returns ``None`` when the policy never posts that relationship.
+      * ``Direct`` / ``Strong indirect`` need ``MIN_CORRELATION_FOR_ALERT``.
+      * ``Contextual`` needs that threshold plus ``CONTEXTUAL_ALERT_MARGIN``,
+        because a shared subject alone is much weaker evidence than a concrete
+        development.
+    """
+    if classify_relationship(relationship):
+        return MIN_CORRELATION_FOR_ALERT
+    if relationship == "Contextual":
+        return MIN_CORRELATION_FOR_ALERT + CONTEXTUAL_ALERT_MARGIN
+    return None
+
+
+def is_alertable(relationship: str, score: int) -> bool:
+    """Whether the configured policy allows this match to be posted.
+
+    This is the single posting gate for news alerts; ``compute_correlation``
+    deliberately returns weaker matches too, so the gate -- not the scorer --
+    decides what a server actually receives.
+    """
+    threshold = required_score(relationship)
+    return threshold is not None and score >= threshold
 
 
 def article_fingerprint(article: dict[str, Any]) -> str:
@@ -382,6 +509,24 @@ MARKET_MATCH_STOP_WORDS = frozenset(
         "up", "versus", "vs", "win", "winner", "wins", "won",
         "market", "markets", "polymarket", "announces",
         "announced", "confirms", "confirmed", "expected", "whether",
+        # Function words and connectives that show up capitalized mid-headline.
+        "if", "only", "otherwise", "however", "apart", "according", "still",
+        "yet", "also", "now", "then", "both", "each", "every", "many", "some",
+        "such", "just", "am", "pm", "et", "us", "uk", "eu", "un", "mr", "ms",
+        "dr", "st", "other", "others", "through", "throughout", "until",
+        "till", "across", "during", "since", "despite", "while", "without",
+        "within", "onto", "upon", "per", "via", "among", "around", "besides",
+        "beyond", "toward", "towards", "amid", "ago", "least", "most", "many",
+        # Words that are only ever page furniture or a social-sharing prompt.
+        "media", "social",
+        # Generic nouns whose identity always lives in the other tokens: a market
+        # about a US state or the United States is identified by the state,
+        # country or person it names, never by the word "state" itself.
+        "state", "states", "united", "global", "international", "world",
+        # Article-page boilerplate that would otherwise become an "entity".
+        "follow", "read", "share", "subscribe", "click", "photo", "image",
+        "video", "watch", "advertisement", "copyright", "rights",
+        "reserved", "editor", "opinion", "posted", "updated", "home",
     }
 )
 
@@ -389,7 +534,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger("lash-news-bot")
 
 
 def is_owner(user_id: int) -> bool:
@@ -687,6 +831,68 @@ def make_market_news_query(
     return " OR ".join(clauses)
 
 
+# Calendar vocabulary is never evidence on its own: a market that resolves "by
+# October 31" and an article published in October share a month, not a subject.
+# Measured live: without this, "School holiday tomorrow (October 16, 2026)"
+# matched a tweet-count market at 100%.
+CALENDAR_TERMS = frozenset({
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct",
+    "nov", "dec",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    "sunday", "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri",
+    "sat", "sun", "weekend", "weekday", "monthly", "annual", "quarterly",
+})
+
+
+def is_weak_evidence_term(token: str) -> bool:
+    """True for tokens that are numbers or calendar words.
+
+    Both are shared by unrelated stories constantly, so they can add to a score
+    once something substantive established the link, but they can never be the
+    link.
+    """
+    return is_numeric_term(token) or token in CALENDAR_TERMS
+
+
+def is_numeric_term(token: str) -> bool:
+    """True for a bare number or year.
+
+    Numbers are weak evidence on their own: a market that resolves on ``$90``
+    and an article that mentions ``9%`` share a token, not a subject. Numbers
+    still add to a score once some substantive term has established the link.
+    """
+    return bool(re.fullmatch(r"\d+(?:\.\d+)?", token or ""))
+
+
+def compute_common_catalog_terms(
+    markets: list[dict[str, Any]], minimum_share: float = 0.15
+) -> frozenset[str]:
+    """Vocabulary that appears across too much of the catalog to identify a market.
+
+    A token like ``october``, ``state`` or ``2026`` is in dozens of unrelated
+    market questions, so sharing it with an article says nothing. Terms above
+    ``minimum_share`` of the catalog are treated as non-evidence; a term that
+    only a few markets use (``greenland``, ``brent``) stays decisive.
+    """
+    if not markets:
+        return frozenset()
+    counts: Counter[str] = Counter()
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        terms = meaningful_market_terms(market.get("question") or "")
+        terms |= {
+            normalize_entity(entity) for entity in (market.get("entities") or set())
+        }
+        counts.update(term for term in terms if term)
+    threshold = max(2, int(len(markets) * minimum_share))
+    return frozenset(
+        term for term, count in counts.items() if count >= threshold
+    )
+
+
 def normalize_entity(token: str) -> str:
     """Fold a candidate entity to a comparable key.
 
@@ -763,11 +969,14 @@ def parse_market_question(market: dict[str, Any]) -> dict[str, Any]:
 
     end_date = parse_published_at(market.get("endDate"))
 
-    # Try to pull out the named entities so we can tell whether an article
-    # is about the specific thing the market resolves on.
+    # Pull out the named entities so we can tell whether an article is about the
+    # specific thing the market resolves on. The description is deliberately
+    # excluded: Gamma descriptions are long resolution paragraphs full of
+    # capitalized ordinary words ("Note", "If", "However", "Otherwise"), and
+    # treating those as identities made unrelated stories look correlated. The
+    # question and the event title carry the market's actual subject, and the
+    # description still feeds the resolution/focus checks below.
     named_entities: set[str] = set()
-    if description:
-        named_entities |= extract_named_entities(description)
     if event_title:
         named_entities |= extract_named_entities(event_title)
     named_entities |= extract_named_entities(question)
@@ -821,12 +1030,19 @@ def score_source_reliability(source: NewsSource) -> int:
 def compute_correlation(
     article: dict[str, Any],
     market: dict[str, Any],
+    *,
+    common_terms: frozenset[str] = frozenset(),
 ) -> MarketMatch | None:
     """Evaluate the real relationship between one article and one market.
 
     Returns a MarketMatch only when the relationship is strong enough to explain
     why this specific story matters to this specific market. Returns None when the
     connection is weak, unsupported, stale, or ambiguous.
+
+    ``common_terms`` carries the vocabulary that is too widespread across the
+    catalog to identify any one market (see
+    :func:`compute_common_catalog_terms`). Passing it makes the check stricter;
+    the default keeps this function usable on its own.
     """
     source = source_from_article(article)
     parsed_market = parse_market_question(market)
@@ -863,6 +1079,40 @@ def compute_correlation(
     if not meaningful_overlap:
         return None
 
+    # A link that rests only on numbers, dates, or catalog-wide vocabulary is a
+    # keyword coincidence, not a relationship. At least one term has to actually
+    # identify this particular market.
+    substantive_entities = {
+        entity
+        for entity in meaningful_entities
+        if not is_weak_evidence_term(entity) and entity not in common_terms
+    }
+    substantive_terms = {
+        term
+        for term in question_term_overlap
+        if not is_weak_evidence_term(term) and term not in common_terms
+    }
+    # A named entity that few markets mention is strong evidence on its own
+    # ("iran", "brent", "greenland"). Ordinary vocabulary is not: a single shared
+    # word -- "strike", "post", "state" -- links two completely unrelated stories,
+    # so it takes at least two of them to count as a link.
+    if not substantive_entities and len(substantive_terms) < MIN_SUBSTANTIVE_TERMS:
+        return None
+
+    # The evidence has to be in what the article's headline reports. NewsAPI's
+    # description/content fields carry site furniture and "related article" text,
+    # so a body match alone is not a statement about the story: without this, a
+    # 3D-printer launch once matched a football market because the page mentioned
+    # Frankfurt somewhere below the fold.
+    if REQUIRE_HEADLINE_EVIDENCE:
+        headline_entities = extract_named_entities(headline)
+        headline_terms = meaningful_market_terms(headline)
+        if not (
+            (substantive_entities & headline_entities)
+            or (substantive_terms & headline_terms)
+        ):
+            return None
+
     # ---- relationship reasoning ------------------------------------
     relationship = _classify_relationship(
         article=article,
@@ -890,9 +1140,9 @@ def compute_correlation(
         published_at=published_at,
     )
 
-    if relationship == "Contextual" and score < MIN_CORRELATION_FOR_ALERT:
-        return None
-
+    # Retain anything above the diagnostics floor so the rejection is visible
+    # and tunable; the posting decision itself is made by the policy gate in
+    # select_polymarket_market().
     if score < MIN_CORRELATION_FOR_DIAGNOSTICS:
         return None
 
@@ -1424,22 +1674,34 @@ def select_polymarket_market(
         key=lambda match: (match.score, match.relationship != "Direct"),
         reverse=True,
     )
-    top = ranked[:MAX_RELATED_MARKETS]
-    cutoffs: list[MarketMatch] = []
-    for match in top:
-        if match.score >= MIN_CORRELATION_FOR_DIAGNOSTICS:
-            cutoffs.append(match)
-    if not cutoffs:
-        cutoffs = top[:1]
-    return cutoffs
+    # The policy gate: only matches the configured thresholds allow may post.
+    # Everything else stays available for diagnostics and tuning, but it must
+    # never ride along on an alert, so nothing is substituted in its place.
+    return [
+        match for match in ranked if is_alertable(match.relationship, match.score)
+    ][:MAX_RELATED_MARKETS]
+
+
+def _market_price_label(market: dict[str, Any]) -> str:
+    """A compact price label for one market, e.g. ``$0.50``, or "" if unknown."""
+    prices = parse_outcome_prices(market)
+    if prices:
+        return f"${prices[0]:.2f}"
+    last = as_float(market.get("lastTradePrice"))
+    if last is not None:
+        return f"${last:.2f}"
+    return ""
 
 
 def _related_markets_field(matches: list[MarketMatch]) -> str:
-    """Format the Related Markets embed field from qualified matches.
+    """Format the Related Markets embed field: one compact line per market.
 
-    Each related market shows the exact market question, the verified Polymarket
-    platform label, the correlation percentage, a clickable link, and a short
-    reason when space permits. No political alignment is included.
+    Each line follows the reference Market Intel design --
+
+        ``\u2022 [Polymarket] <market question> | $0.50 (correlation: 75%)``
+
+    i.e. platform, question, the market's current price when one is available,
+    and the correlation score. No political alignment is included.
     """
     if not matches:
         return "No qualifying market correlation this cycle."
@@ -1457,14 +1719,12 @@ def _related_markets_field(matches: list[MarketMatch]) -> str:
                 else ""
             )
         market_link = f"[Polymarket]({url})" if url else "Polymarket"
-        score = match.score
-        relationship = match.relationship
-
-        entry = [f"• [{market_link}] {question} — Correlation: {score}%"]
-        if match.why_short:
-            entry.append(f"    * {match.why_short}")
-        if match.explanation and len(match.explanation) <= 300 and relationship in {"Direct", "Strong indirect"}:
-            entry.append(f"    * Why it matches: {match.explanation}")
+        details = " ".join(
+            part
+            for part in (_market_price_label(market), f"(correlation: {match.score}%)")
+            if part
+        )
+        entry = [f"• [{market_link}] {question} | {details}"]
 
         # Keep whole market entries: an entry that would overflow the field is
         # dropped rather than cut in half, so every market shown stays readable.
@@ -3045,6 +3305,50 @@ class LashNewsBot(commands.Bot):
             and legacy_guild_id not in self.guild_settings
         ):
             destinations[legacy_guild_id] = legacy_channel
+
+        # Bootstrap fallback for one category. It exists so a category cannot sit
+        # dead forever because nobody ran its /set-...-alerts command -- including
+        # after a deploy that started with an empty state directory. It only ever
+        # fills a gap: an explicit choice always wins, a category switched off in
+        # that server is respected, and the channel must belong to the server it
+        # is used for, so it can never point one server's alerts at another's
+        # channel.
+        fallback_channel_id = alert_fallback_channel_id(alert)
+        if fallback_channel_id is not None:
+            for guild in list(getattr(self, "guilds", []) or []):
+                guild_id = str(guild.id)
+                if guild_id in destinations:
+                    continue
+                settings = self.get_settings(guild_id)
+                if not settings.get("alerts", {}).get(alert, True):
+                    continue
+                if effective_channel_id(settings, alert) is not None:
+                    continue
+                try:
+                    channel = await self.resolve_channel(fallback_channel_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "Could not resolve the %s fallback channel %s.",
+                        alert,
+                        fallback_channel_id,
+                    )
+                    break
+                if str(channel.guild.id) != guild_id:
+                    continue
+                logger.info(
+                    "No %s channel is configured for server %s; using the "
+                    "configured fallback channel %s. Run %s to choose another.",
+                    alert,
+                    guild_id,
+                    fallback_channel_id,
+                    ALERT_CHANNEL_COMMANDS[alert],
+                )
+                self.ensure_guild_history(guild_id)
+                destinations[guild_id] = channel
+                break
+
         if not destinations and resolution_failures:
             raise RuntimeError("Could not resolve any configured Discord alert channel.")
 
@@ -4429,13 +4733,13 @@ class LashNewsBot(commands.Bot):
         )
         failures: list[str] = []
         attempted = 0
+        skipped: list[str] = []
         for name, alert, runner in subsystems:
             destinations = destinations_by_alert.get(alert) or {}
             if not destinations:
-                logger.debug(
-                    "Skipping the %s monitor: no channel is configured for it.",
-                    name,
-                )
+                # This used to be a debug line, which is why a category that was
+                # never pointed at a channel looked exactly like a dead task.
+                skipped.append(f"{name} (run {ALERT_CHANNEL_COMMANDS[alert]})")
                 continue
             attempted += 1
             try:
@@ -4445,6 +4749,15 @@ class LashNewsBot(commands.Bot):
             except Exception as exc:
                 failures.append(f"{name}: {exc}")
                 logger.exception("The %s monitor failed.", name)
+
+        self.skipped_alerts = skipped
+        if skipped:
+            logger.warning(
+                "%d alert category/ies are not being polled because no channel "
+                "is configured for them: %s. Everything else is unaffected.",
+                len(skipped),
+                "; ".join(skipped),
+            )
 
         self.last_poll_at = datetime.now(timezone.utc)
         self.last_poll_error = "; ".join(failures)[:300] if failures else None
@@ -4494,8 +4807,10 @@ class LashNewsBot(commands.Bot):
         destinations: dict[str, discord.TextChannel | discord.Thread],
     ) -> None:
         if not getattr(self, "news_api_keys", None):
-            logger.debug(
-                "Skipping the news monitor: no NewsAPI key is configured."
+            logger.warning(
+                "Skipping the news monitor: NEWS_API_KEY is not set, so no news "
+                "alert can be delivered. Set NEWS_API_KEY (or NEWS_API_KEYS) to "
+                "re-enable news polling."
             )
             return
         if self.news_session is None:
@@ -4642,11 +4957,12 @@ class LashNewsBot(commands.Bot):
             )
         elif not correlated_articles:
             logger.warning(
-                "NewsAPI returned %d article(s) but none correlated with an active "
-                "market at the current thresholds (correlation >= %d and a direct "
-                "or strong indirect relationship), so nothing was posted.",
+                "NewsAPI returned %d article(s) but none cleared the alert bar "
+                "(correlation >= %d for a direct or strong indirect match, >= %d "
+                "for a contextual one), so nothing was posted.",
                 len(raw_articles),
                 MIN_CORRELATION_FOR_ALERT,
+                MIN_CORRELATION_FOR_ALERT + CONTEXTUAL_ALERT_MARGIN,
             )
 
     @staticmethod
@@ -5433,7 +5749,16 @@ class LashNewsBot(commands.Bot):
                     **parsed,
                     "source": market,
                 }
-        return list(catalog.values())
+        markets = list(catalog.values())
+        # Computed from the catalog itself, so "october" or "2026" cannot link an
+        # unrelated article to a market just because both mention it.
+        self.catalog_common_terms = compute_common_catalog_terms(markets)
+        logger.debug(
+            "Correlation vocabulary: %d catalog-wide term(s) excluded from "
+            "evidence.",
+            len(self.catalog_common_terms),
+        )
+        return markets
 
     def _correlate_article(
         self, article: dict[str, Any], catalog: list[dict[str, Any]]
@@ -5487,11 +5812,13 @@ class LashNewsBot(commands.Bot):
         if not candidates:
             return []
 
+        common_terms = getattr(self, "catalog_common_terms", frozenset())
         for candidate in candidates:
             try:
                 match = compute_correlation(
                     article=article,
                     market=candidate["market"],
+                    common_terms=common_terms,
                 )
             except asyncio.CancelledError:
                 raise
@@ -5505,7 +5832,22 @@ class LashNewsBot(commands.Bot):
                 continue
             matches.append(match)
 
-        return select_polymarket_market(matches)
+        selected = select_polymarket_market(matches)
+        if matches and not selected:
+            # Retained by the diagnostics floor but below the posting bar. This
+            # is the line that tells an operator why a plausible-looking story
+            # did not alert and how far off it was.
+            best = max(matches, key=lambda match: match.score)
+            logger.info(
+                "No market cleared the alert bar for %r; the closest was %r at "
+                "%d%% (%s, needs %s%%).",
+                headline[:120],
+                clean_article_text(best.market.get("question"))[:120],
+                best.score,
+                best.relationship,
+                required_score(best.relationship),
+            )
+        return selected
 
     # ------------------------------------------------------------------
     # Embed builders
@@ -5546,11 +5888,15 @@ class LashNewsBot(commands.Bot):
             else None
         )
 
+        # Reference layout: a News line naming the publisher and the headline,
+        # then a Read Article link, then Summary and Related Markets below.
+        # Political alignment is deliberately not part of this design.
         embed = discord.Embed(
             title="Market Intel | Sovereign Predicts",
+            url=url if url.startswith(("https://", "http://")) else None,
             description=(
-                f"**News**\n[{source_name} — {url}]({url})\n\n"
-                f"**Link**\n[Read Article]({url})"
+                f"**News:** [{source_name}] {headline}\n"
+                f"**Link:** [Read Article]({url})"
             ),
             color=SOVEREIGN_COLOR,
             timestamp=published_at or datetime.now(timezone.utc),
@@ -5577,9 +5923,19 @@ class LashNewsBot(commands.Bot):
                 inline=False,
             )
 
+        # "Generated by Sovereign Predicts | 31/07/2026, 1:09 AM", as in the
+        # reference design. The publisher is already named on the News line, so
+        # the footer carries the attribution and the publication stamp.
+        # Plain text, not Discord's <t:...> markup: markup is rendered in an
+        # embed description or field but not in a footer, where it would appear
+        # literally.
         embed.set_footer(
-            text=f"Sovereign Predicts | {source_name} | "
-            f"{discord.utils.format_dt(published_at, style='R') if published_at else 'publication time unknown'}",
+            text="Generated by Sovereign Predicts | "
+            + (
+                published_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                if published_at
+                else "publication time unknown"
+            ),
         )
         return embed
 
