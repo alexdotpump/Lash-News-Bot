@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -388,6 +389,44 @@ class NewsProviderTests(unittest.IsolatedAsyncioTestCase):
                 await bot.close()
             finally:
                 os.chdir(cwd)
+
+
+class ChartDependencyTests(unittest.TestCase):
+    """Regression test for the production /chart failure.
+
+    /chart reported "Chart rendering isn't available right now" in production
+    while passing locally, because main.py imports matplotlib lazily -- so a
+    broken install disables /chart instead of stopping the bot -- and the local
+    virtualenv already had it. The Docker image installs only what
+    requirements.txt declares, and matplotlib was missing from it. This pins the
+    declared dependency the image needs.
+    """
+
+    def test_matplotlib_is_a_declared_requirement(self):
+        requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+        declared = {
+            line.split("=")[0].split(">")[0].strip().lower()
+            for line in requirements.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        self.assertIn(
+            "matplotlib",
+            declared,
+            "matplotlib must be declared or the deployed image cannot render "
+            "/chart",
+        )
+
+    def test_a_missing_renderer_raises_instead_of_returning_a_blank_image(self):
+        import sys
+
+        with mock.patch.dict(sys.modules, {"matplotlib": None}):
+            with self.assertRaises(ImportError):
+                main.render_price_chart(
+                    question="q",
+                    slug="s",
+                    outcome_label="Yes",
+                    points=[(10, 0.5), (20, 0.6)],
+                )
 
 
 if __name__ == "__main__":

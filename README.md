@@ -35,8 +35,17 @@ after every deploy.
 |---|---|---|
 | `/setup` | administrators | Pick the alert channel and toggle each alert type for this server. |
 | `/alerts` | administrators | Set the price-move, large-trade, and new-market thresholds. |
-| `/status` | members | Monitoring health, last successful check, and this server's settings. |
+| `/set-news-alerts`, `/set-price-alerts`, `/set-new-markets`, `/set-whale-alerts`, `/set-wallet-alerts` | administrators | Send one alert category to its own channel. |
+| `/status` | members | Per-subsystem health (Discord, news polling, market-data polling, wallet tracking, alert delivery) and this server's settings. |
 | `/test` | members | Send a test embed to the configured channel. |
+| `/chart` | members | Render a market's price history as a PNG. |
+| `/config-check` | members | Report broken alert channels or permissions. |
+| `/wallet add` | administrators | Track a Polymarket wallet address here. |
+| `/wallet remove` | administrators | Stop tracking a wallet. |
+| `/wallet list` | members | List this server's tracked wallets. |
+| `/wallet info` | members | Show one tracked wallet's settings and status. |
+| `/wallet settings` | administrators | Change a wallet's label, minimum value, activity filter, or whale-alert suppression. |
+| `/wallet pause`, `/wallet resume` | administrators | Stop or restart alerts for one wallet without deleting it. |
 | `/sources` | administrators | Show or configure which publishers this server accepts. |
 | `/keywords` | administrators | View or manage include/exclude keywords. |
 | `/help` | everyone | Command list. |
@@ -59,6 +68,37 @@ after every deploy.
   `taker_only=true` and a server-side `filter_type=CASH` floor) so only **executed taker
   fills** alert, never open orders or positions. Each embed says so explicitly and links the
   transaction on Polygonscan.
+- **Wallet activity** — watches the addresses a server tracks. See below.
+
+### Wallet tracking
+
+Each server keeps its own watchlist. Wallets are identified by their address; a label is
+cosmetic. Watchlists persist in `wallets.json` inside `STATE_DIR`, so they survive a redeploy
+when `STATE_DIR` is a mounted volume.
+
+- **Data source** — Polymarket's Data API activity feed,
+  `https://data-api.polymarket.com/activity?user=<address>`, the same public host the whale
+  monitor already uses. Verified live: it returns `TRADE`, `SPLIT`, `MERGE`, `REDEEM`,
+  `REWARD`, and `CONVERSION` rows carrying `usdcSize` (the settled transaction value), price,
+  side, market title, slug, and the transaction hash. Addresses are Polymarket proxy wallets:
+  a plain EVM `0x` address. A syntactically valid address that is not a Polymarket account is
+  accepted but reports no activity, and `/wallet add` says so instead of pretending.
+- **What is tracked** — new activity rows for a tracked wallet, with the market, outcome,
+  side, size, transaction value, timestamp, and links to the market and the transaction.
+- **Filters** — an activity filter (`trades` for executed fills only, `all` for every row),
+  a per-wallet minimum transaction value, and pause/resume.
+- **Dedupe and baselines** — the first check after a wallet is added only records a baseline,
+  so adding a busy wallet does not dump its history into the channel. Each wallet remembers
+  its newest processed timestamp plus a bounded set of activity keys, and both are persisted,
+  so a restart cannot replay an alert.
+- **Whale overlap** — a tracked wallet's large fill would otherwise alert twice (once from the
+  whale monitor, once from the wallet monitor). By default the whale copy is suppressed for
+  tracked wallets; `/wallet settings whale_alerts:true` turns it back on.
+- **Value vs position** — the reported value is the value of that single activity row. It is
+  not the wallet's total position, ownership, or intent, and every wallet embed says so.
+- **Bounds** — at most `MAX_TRACKED_WALLETS_PER_GUILD` (25) wallets per server and
+  `MAX_WALLET_ADDRESSES_PER_CYCLE` (50) distinct addresses polled per cycle, one request per
+  address per cycle no matter how many servers track it.
 
 ### News correlation engine
 
@@ -120,6 +160,10 @@ If commands appear but answering them fails, or they never appear at all:
 - Python 3.11+
 - `discord.py` for the Discord connection and application commands
 - `aiohttp` for asynchronous NewsAPI, Polymarket Gamma, and Polymarket Data API requests
+- `matplotlib` for `/chart`. It is imported lazily so a broken install disables `/chart`
+  instead of stopping the bot, which also means it must stay declared in `requirements.txt`
+  or the deployed image has no renderer — that was the production `/chart` failure.
+  `tests/test_chart_and_providers.py` pins the dependency.
 
 ## Files
 
@@ -130,6 +174,8 @@ If commands appear but answering them fails, or they never appear at all:
   (`tests/test_correlation.py`).
 - `guild_settings.json` — per-server settings (created at runtime, in `STATE_DIR`).
 - `monitor_state.json` — cross-restart dedupe and price baselines (in `STATE_DIR`).
+- `wallets.json` — per-server wallet watchlists, per-wallet settings, and wallet dedupe state
+  (in `STATE_DIR`).
 - `seen_articles_by_guild.json` — duplicate history kept independently for each server.
 - `guild_channels.json` — legacy alert-channel file, still read for backward compatibility.
 

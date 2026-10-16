@@ -1,3 +1,8 @@
 discord.py==2.3.2
 aiohttp==3.9.1
 python-dotenv==1.0.0
+# /chart renders price history to a PNG. Imported lazily in main.py so a broken
+# install disables /chart instead of stopping the bot, but it must be declared
+# here or the production image has no renderer and /chart reports
+# "Chart rendering isn't available right now".
+matplotlib==3.8.2

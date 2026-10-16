@@ -23,6 +23,10 @@ POLYMARKET_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 POLYMARKET_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
 POLYMARKET_DATA_API_URL = "https://data-api.polymarket.com"
 POLYMARKET_TRADES_URL = f"{POLYMARKET_DATA_API_URL}/v2/trades"
+# Per-wallet activity feed on the same Data API the whale monitor already uses.
+# Verified live: /activity?user=<address> returns TRADE/SPLIT/MERGE/REDEEM rows
+# carrying usdcSize (transaction value), price, side, market title and tx hash.
+POLYMARKET_WALLET_ACTIVITY_URL = f"{POLYMARKET_DATA_API_URL}/activity"
 POLYMARKET_MARKET_PAGE = "https://polymarket.com/market"
 # Polymarket's CLOB price-history endpoint, used by /chart.
 POLYMARKET_PRICE_HISTORY_URL = "https://clob.polymarket.com/prices-history"
@@ -36,6 +40,7 @@ GUILD_CHANNELS_FILE = STATE_DIR / "guild_channels.json"
 GUILD_SEEN_ARTICLES_FILE = STATE_DIR / "seen_articles_by_guild.json"
 GUILD_SETTINGS_FILE = STATE_DIR / "guild_settings.json"
 MONITOR_STATE_FILE = STATE_DIR / "monitor_state.json"
+WALLETS_FILE = STATE_DIR / "wallets.json"
 
 MAX_MARKET_LOOKUPS_PER_POLL = 20
 MAX_SAVED_ARTICLES = 500
@@ -66,12 +71,52 @@ MIN_WHALE_MIN_USD = 100.0
 # market -- and let administrators raise it through /alerts.
 DEFAULT_NEW_MARKET_MIN_LIQUIDITY = 0.0
 MIN_PRICE_ALERT_LIQUIDITY = 5_000.0
-ALERT_TYPES = ("news", "price", "new_market", "whale")
+
+# ---------------------------------------------------------------------------
+# Wallet watchlists
+# ---------------------------------------------------------------------------
+# Polymarket accounts are proxy wallets, so every tracked address is an EVM
+# 0x-prefixed, 40-hex-character address. The address is the identity and the
+# label is decorative. Watchlists live in their own state file so a large
+# watchlist never bloats guild_settings.json.
+WALLET_ADDRESS_PATTERN = re.compile(r"^0[xX][0-9a-fA-F]{40}$")
+MAX_TRACKED_WALLETS_PER_GUILD = 25
+MAX_WALLET_LABEL_LENGTH = 40
+# Exactly one activity request per distinct address per cycle, hard-capped so a
+# large watchlist can never turn one cycle into an unbounded burst of calls.
+MAX_WALLET_ADDRESSES_PER_CYCLE = 50
+WALLET_ACTIVITY_PAGE_SIZE = 50
+MAX_WALLET_SEEN_EVENTS = 200
+MAX_WALLET_TYPES_DISPLAYED = 6
+DEFAULT_WALLET_MIN_USD = 0.0
+MIN_WALLET_MIN_USD = 0.0
+MAX_WALLET_MIN_USD = 10_000_000.0
+# "trades" limits a watch to executed fills; "all" also covers splits, merges,
+# redeems and reward payouts. Both are real rows in the Data API activity feed.
+WALLET_ACTIVITY_FILTERS = ("all", "trades")
+WALLET_ACTIVITY_FILTER_LABELS = {
+    "all": "All activity",
+    "trades": "Executed trades only",
+}
+# Activity types the Data API is known to report. They are used for display;
+# a watch filtered to "all" accepts whatever type the API returns, so a new
+# server-side type is delivered instead of silently dropped.
+KNOWN_WALLET_ACTIVITY_TYPES = (
+    "TRADE",
+    "SPLIT",
+    "MERGE",
+    "REDEEM",
+    "REWARD",
+    "CONVERSION",
+)
+WALLET_BUY_ACTIVITY_TYPES = ("TRADE",)
+ALERT_TYPES = ("news", "price", "new_market", "whale", "wallet")
 ALERT_LABELS = {
     "news": "News alerts",
     "price": "Price alerts",
     "new_market": "New market alerts",
     "whale": "Whale alerts",
+    "wallet": "Wallet alerts",
 }
 # The slash command that points one alert category at its own channel.
 ALERT_CHANNEL_COMMANDS = {
@@ -79,6 +124,7 @@ ALERT_CHANNEL_COMMANDS = {
     "price": "/set-price-alerts",
     "new_market": "/set-new-markets",
     "whale": "/set-whale-alerts",
+    "wallet": "/set-wallet-alerts",
 }
 
 
@@ -1723,6 +1769,178 @@ def load_monitor_state() -> dict[str, Any]:
 def save_monitor_state(state: dict[str, Any]) -> None:
     write_json_atomically(MONITOR_STATE_FILE, state)
 
+# ---------------------------------------------------------------------------
+# Wallet watchlist storage
+# ---------------------------------------------------------------------------
+
+
+def normalize_wallet_address(value: Any) -> str | None:
+    """Return the canonical (lower-case) watch address, or None when invalid.
+
+    Polymarket accounts are proxy wallets, so an address must be a plain EVM
+    0x address. A profile name, a truncated address, or a market slug is
+    rejected instead of being stored as something that can never match.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not WALLET_ADDRESS_PATTERN.match(candidate):
+        return None
+    return candidate.lower()
+
+
+def short_wallet_address(address: str) -> str:
+    """A readable address for embeds: 0x1234…abcd."""
+    if len(address) > 12:
+        return f"{address[:6]}\u2026{address[-4:]}"
+    return address
+
+
+def default_wallet_watch(address: str) -> dict[str, Any]:
+    """The full shape of one tracked wallet (always the same keys)."""
+    return {
+        "address": address,
+        "label": "",
+        "min_usd": DEFAULT_WALLET_MIN_USD,
+        "activity_filter": "trades",
+        "paused": False,
+        # A tracked wallet's fill would otherwise alert twice: once through the
+        # global whale monitor and once through the wallet alert. Suppressing
+        # the whale copy is the default; /wallet settings can turn it off.
+        "suppress_whale": True,
+        "last_seen_ts": 0.0,
+        "seen": [],
+    }
+
+
+def normalize_wallet_watch(address: Any, raw: Any) -> dict[str, Any] | None:
+    """Coerce one stored watch into a known-good shape, or drop it."""
+    normalized_address = normalize_wallet_address(address)
+    if normalized_address is None:
+        return None
+    watch = default_wallet_watch(normalized_address)
+    if not isinstance(raw, dict):
+        return watch
+
+    label = clean_article_text(raw.get("label"))[:MAX_WALLET_LABEL_LENGTH].strip()
+    if label:
+        watch["label"] = label
+    minimum = as_float(raw.get("min_usd"))
+    if minimum is not None:
+        watch["min_usd"] = clamp(minimum, MIN_WALLET_MIN_USD, MAX_WALLET_MIN_USD)
+    activity_filter = raw.get("activity_filter")
+    if isinstance(activity_filter, str) and activity_filter in WALLET_ACTIVITY_FILTERS:
+        watch["activity_filter"] = activity_filter
+    if isinstance(raw.get("paused"), bool):
+        watch["paused"] = raw["paused"]
+    if isinstance(raw.get("suppress_whale"), bool):
+        watch["suppress_whale"] = raw["suppress_whale"]
+    last_seen = as_float(raw.get("last_seen_ts"))
+    if last_seen is not None and last_seen >= 0:
+        watch["last_seen_ts"] = last_seen
+    seen = raw.get("seen")
+    if isinstance(seen, list):
+        watch["seen"] = dedupe_strings(seen)[-MAX_WALLET_SEEN_EVENTS:]
+    return watch
+
+
+def normalize_wallet_state(raw: Any) -> dict[str, dict[str, Any]]:
+    """Coerce the whole watchlist file; a corrupt entry never breaks startup."""
+    state: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return state
+    for guild_id, guild_raw in raw.items():
+        if not isinstance(guild_id, str) or not guild_id.isdigit():
+            continue
+        watches_raw = (
+            guild_raw.get("watches") if isinstance(guild_raw, dict) else None
+        )
+        if not isinstance(watches_raw, dict):
+            continue
+        watches: dict[str, dict[str, Any]] = {}
+        for address, watch_raw in watches_raw.items():
+            watch = normalize_wallet_watch(address, watch_raw)
+            if watch is not None:
+                watches[watch["address"]] = watch
+        state[guild_id] = {"watches": watches}
+    return state
+
+
+def load_wallet_state() -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(WALLETS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not read the wallet watchlist file; starting fresh.")
+        return {}
+    return normalize_wallet_state(data)
+
+
+def save_wallet_state(state: dict[str, dict[str, Any]]) -> None:
+    write_json_atomically(WALLETS_FILE, state)
+
+
+def wallet_activity_type(event: dict[str, Any]) -> str:
+    return clean_article_text(
+        event.get("type") or event.get("activityType")
+    ).upper() or "OTHER"
+
+
+def wallet_event_value(event: dict[str, Any]) -> float | None:
+    """The transaction value in USDC.
+
+    ``usdcSize`` is the settled cash amount the Data API reports for a wallet
+    activity row. It is the trade's value, not the wallet's position size.
+    """
+    for key in ("usdcSize", "usdc_size", "value"):
+        number = as_float(event.get(key))
+        if number is not None:
+            return number
+    size = as_float(event.get("size"))
+    price = as_float(event.get("price"))
+    if size is None or price is None:
+        return None
+    return size * price
+
+
+def wallet_activity_key(event: dict[str, Any]) -> str | None:
+    """A stable identity for one activity row so it is never alerted twice."""
+    transaction = event.get("transactionHash") or event.get("transaction_hash")
+    if not transaction:
+        return None
+    parts = (
+        transaction,
+        event.get("type") or event.get("activityType"),
+        event.get("asset") or event.get("token_id"),
+        event.get("side"),
+        event.get("size"),
+        event.get("price"),
+        event.get("timestamp"),
+    )
+    return "|".join(str(part) for part in parts)
+
+
+def wallet_event_market_url(event: dict[str, Any]) -> str:
+    slug = event.get("slug") or event.get("eventSlug")
+    if isinstance(slug, str) and slug.strip():
+        return f"{POLYMARKET_MARKET_PAGE}/{quote(slug.strip(), safe='-_')}"
+    return "https://polymarket.com"
+
+
+def describe_wallet_watch(watch: dict[str, Any]) -> str:
+    """A one-line human summary of a watch, used by /wallet list and info."""
+    label = watch.get("label") or short_wallet_address(watch["address"])
+    state = "paused" if watch.get("paused") else "active"
+    threshold = watch.get("min_usd") or 0.0
+    activity = WALLET_ACTIVITY_FILTER_LABELS.get(
+        watch.get("activity_filter", "all"), "All activity"
+    )
+    return (
+        f"**{label}** \u2014 `{short_wallet_address(watch['address'])}` \u00b7 {state} "
+        f"\u00b7 {activity} \u00b7 min ${threshold:,.0f}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # /chart: Polymarket price history and PNG rendering
@@ -1841,6 +2059,385 @@ def render_price_chart(
     return buffer.getvalue()
 
 
+def apply_watch_options(
+    watch: dict[str, Any],
+    *,
+    label: str | None = None,
+    min_usd: float | None = None,
+    activity_filter: str | None = None,
+    suppress_whale: bool | None = None,
+) -> dict[str, Any]:
+    """Merge user-supplied /wallet options onto a watch, clamped and coerced."""
+    if label is not None:
+        watch["label"] = clean_article_text(label)[:MAX_WALLET_LABEL_LENGTH].strip()
+    if min_usd is not None:
+        watch["min_usd"] = clamp(min_usd, MIN_WALLET_MIN_USD, MAX_WALLET_MIN_USD)
+    if activity_filter is not None and activity_filter in WALLET_ACTIVITY_FILTERS:
+        watch["activity_filter"] = activity_filter
+    if suppress_whale is not None:
+        watch["suppress_whale"] = bool(suppress_whale)
+    return watch
+
+
+class WalletCommands(app_commands.Group):
+    """The /wallet watchlist command group.
+
+    Every subcommand is a method on this group rather than on the bot, because a
+    discord.py group owns its children: the group copies each child command and
+    binds it to the group instance, so ``self`` is the group and ``self.bot`` is
+    the bot. Commands declared on the bot itself are top-level, so they cannot be
+    nested under a group name.
+    """
+
+    def __init__(self, bot: "LashNewsBot") -> None:
+        self.bot = bot
+        super().__init__(
+            name="wallet",
+            description="Track Polymarket wallets and alert on their activity.",
+            guild_only=True,
+        )
+
+    @app_commands.command(
+        name="add",
+        description="Track a Polymarket wallet and alert on its activity here.",
+    )
+    @app_commands.describe(
+        address="The wallet address to watch (0x followed by 40 hex characters).",
+        label="A nickname shown in alerts (optional).",
+        min_usd="Only alert on activity worth at least this much (USDC).",
+        activity="Which activity rows should generate an alert.",
+    )
+    @app_commands.choices(
+        activity=[
+            app_commands.Choice(name=WALLET_ACTIVITY_FILTER_LABELS[key], value=key)
+            for key in WALLET_ACTIVITY_FILTERS
+        ]
+    )
+    async def add(
+        self,
+        interaction: discord.Interaction,
+        address: str,
+        label: str | None = None,
+        min_usd: float | None = None,
+        activity: app_commands.Choice[str] | None = None,
+    ) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if not await bot.require_admin(interaction) or guild is None:
+            return
+        normalized = normalize_wallet_address(address)
+        if normalized is None:
+            await interaction.response.send_message(
+                "That is not a wallet address. Send the Polymarket proxy wallet "
+                "as `0x` followed by 40 hex characters (for example "
+                "`0x5fdd66ffd0325d4e8d1d86fbec50caa31770a747`).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        if bot.get_watch(guild.id, normalized) is not None:
+            await interaction.followup.send(
+                f"`{short_wallet_address(normalized)}` is already tracked in this "
+                "server. Use `/wallet info` to see it, or `/wallet settings` to "
+                "change it.",
+                ephemeral=True,
+            )
+            return
+        if bot.watch_limit_reached(guild.id):
+            await interaction.followup.send(
+                f"This server already tracks the maximum of "
+                f"{MAX_TRACKED_WALLETS_PER_GUILD} wallets. Remove one with "
+                "`/wallet remove` first.",
+                ephemeral=True,
+            )
+            return
+
+        watch = apply_watch_options(
+            default_wallet_watch(normalized),
+            label=label,
+            min_usd=min_usd,
+            activity_filter=activity.value if activity is not None else None,
+        )
+        if not bot.set_watch(guild.id, watch):
+            await interaction.followup.send(
+                "I couldn't save this server's watchlist.", ephemeral=True
+            )
+            return
+
+        note = ""
+        try:
+            events = await bot.fetch_wallet_activity(normalized)
+        except Exception as exc:
+            logger.warning(
+                "Could not confirm wallet %s with Polymarket: %s",
+                short_wallet_address(normalized),
+                exc,
+            )
+            note = "\nPolymarket could not be reached to confirm it just now."
+        else:
+            if not events:
+                note = (
+                    "\nPolymarket reports no activity for that address, so it may "
+                    "not be a Polymarket account yet. It is still tracked."
+                )
+        await interaction.followup.send(
+            f"Tracking {describe_wallet_watch(watch)}.\n"
+            "The first check only records a baseline, so existing history is not "
+            "posted; new activity alerts from the next cycle." + note,
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="remove", description="Stop tracking a wallet in this server."
+    )
+    @app_commands.describe(address="The wallet address to stop tracking.")
+    async def remove(self, interaction: discord.Interaction, address: str) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if not await bot.require_admin(interaction) or guild is None:
+            return
+        normalized = normalize_wallet_address(address)
+        if normalized is None:
+            await interaction.response.send_message(
+                "That is not a wallet address (`0x` plus 40 hex characters).",
+                ephemeral=True,
+            )
+            return
+        if not bot.drop_watch(guild.id, normalized):
+            await interaction.response.send_message(
+                f"`{short_wallet_address(normalized)}` is not tracked in this "
+                "server. Use `/wallet list` to see what is.",
+                ephemeral=True,
+            )
+            return
+        bot.save_wallets()
+        bot.prune_empty_guild_wallets(guild.id)
+        await interaction.response.send_message(
+            f"Stopped tracking `{short_wallet_address(normalized)}`.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="list", description="List the wallets this server tracks."
+    )
+    async def list_wallets(self, interaction: discord.Interaction) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Run `/wallet list` inside a Discord server.", ephemeral=True
+            )
+            return
+        watches = bot.list_watches(guild.id)
+        if not watches:
+            await interaction.response.send_message(
+                "This server is not tracking any wallets yet. An administrator "
+                "can add one with `/wallet add`.",
+                ephemeral=True,
+            )
+            return
+        last_check = (
+            discord.utils.format_dt(bot.last_wallet_check_at, style="R")
+            if bot.last_wallet_check_at is not None
+            else "not yet"
+        )
+        lines = [
+            f"**Tracked wallets** ({len(watches)}/{MAX_TRACKED_WALLETS_PER_GUILD})"
+        ]
+        lines.extend(
+            f"\u2022 {describe_wallet_watch(watch)}" for watch in watches[:20]
+        )
+        if len(watches) > 20:
+            lines.append(f"... and {len(watches) - 20} more")
+        lines.append(f"**Last wallet check:** {last_check}")
+        if bot.last_wallet_error:
+            lines.append(f"**Latest issue:** {bot.last_wallet_error[:200]}")
+        await interaction.response.send_message(
+            "\n".join(lines)[:1900], ephemeral=True
+        )
+
+    @app_commands.command(
+        name="info", description="Show one tracked wallet's settings and status."
+    )
+    @app_commands.describe(address="The tracked wallet address.")
+    async def info(self, interaction: discord.Interaction, address: str) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Run `/wallet info` inside a Discord server.", ephemeral=True
+            )
+            return
+        normalized = normalize_wallet_address(address)
+        if normalized is None:
+            await interaction.response.send_message(
+                "That is not a wallet address (`0x` plus 40 hex characters).",
+                ephemeral=True,
+            )
+            return
+        watch = bot.get_watch(guild.id, normalized)
+        if watch is None:
+            await interaction.response.send_message(
+                f"`{short_wallet_address(normalized)}` is not tracked in this "
+                "server. Use `/wallet list` to see the watchlist.",
+                ephemeral=True,
+            )
+            return
+        last_check = (
+            discord.utils.format_dt(bot.last_wallet_check_at, style="R")
+            if bot.last_wallet_check_at is not None
+            else "not yet"
+        )
+        lines = [
+            f"**Wallet:** {watch.get('label') or 'no label'}",
+            f"**Address:** `{normalized}`",
+            f"**Status:** {'paused' if watch.get('paused') else 'active'}",
+            "**Activity filter:** "
+            + WALLET_ACTIVITY_FILTER_LABELS.get(
+                watch.get("activity_filter", "all"), "All activity"
+            ),
+            f"**Minimum value:** ${(watch.get('min_usd') or 0.0):,.2f}",
+            "**Global whale alert for this wallet:** "
+            + ("suppressed" if watch.get("suppress_whale", True) else "also sent"),
+            "**Dedupe history:** "
+            f"{len(watch.get('seen') or [])} event(s) remembered",
+            f"**Last successful wallet check:** {last_check}",
+        ]
+        await interaction.response.send_message(
+            "\n".join(lines)[:1900], ephemeral=True
+        )
+
+    @app_commands.command(
+        name="settings",
+        description="Change one tracked wallet's alert settings.",
+    )
+    @app_commands.describe(
+        address="The tracked wallet address.",
+        label="A new nickname shown in alerts.",
+        min_usd="Minimum activity value in USDC before alerting.",
+        activity="Which activity rows should generate an alert.",
+        whale_alerts="Also send the global large-trade alert for this wallet.",
+    )
+    @app_commands.choices(
+        activity=[
+            app_commands.Choice(name=WALLET_ACTIVITY_FILTER_LABELS[key], value=key)
+            for key in WALLET_ACTIVITY_FILTERS
+        ]
+    )
+    async def settings(
+        self,
+        interaction: discord.Interaction,
+        address: str,
+        label: str | None = None,
+        min_usd: float | None = None,
+        activity: app_commands.Choice[str] | None = None,
+        whale_alerts: bool | None = None,
+    ) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if not await bot.require_admin(interaction) or guild is None:
+            return
+        normalized = normalize_wallet_address(address)
+        if normalized is None:
+            await interaction.response.send_message(
+                "That is not a wallet address (`0x` plus 40 hex characters).",
+                ephemeral=True,
+            )
+            return
+        watch = bot.get_watch(guild.id, normalized)
+        if watch is None:
+            await interaction.response.send_message(
+                f"`{short_wallet_address(normalized)}` is not tracked in this "
+                "server. Add it with `/wallet add` first.",
+                ephemeral=True,
+            )
+            return
+        if label is None and min_usd is None and activity is None and whale_alerts is None:
+            await interaction.response.send_message(
+                f"Current settings: {describe_wallet_watch(watch)}\n"
+                "Pass at least one option to change "
+                "(`label`, `min_usd`, `activity`, or `whale_alerts`).",
+                ephemeral=True,
+            )
+            return
+
+        apply_watch_options(
+            watch,
+            label=label,
+            min_usd=min_usd,
+            activity_filter=activity.value if activity is not None else None,
+            suppress_whale=None if whale_alerts is None else (not whale_alerts),
+        )
+        if not bot.set_watch(guild.id, watch):
+            await interaction.response.send_message(
+                "I couldn't save this server's watchlist.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"Updated {describe_wallet_watch(watch)}.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="pause", description="Pause alerts for a tracked wallet (keeps it tracked)."
+    )
+    @app_commands.describe(address="The tracked wallet address.")
+    async def pause(self, interaction: discord.Interaction, address: str) -> None:
+        await self._set_paused(interaction, address, True)
+
+    @app_commands.command(
+        name="resume", description="Resume alerts for a paused tracked wallet."
+    )
+    @app_commands.describe(address="The tracked wallet address.")
+    async def resume(self, interaction: discord.Interaction, address: str) -> None:
+        await self._set_paused(interaction, address, False)
+
+    async def _set_paused(
+        self, interaction: discord.Interaction, address: str, paused: bool
+    ) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if not await bot.require_admin(interaction) or guild is None:
+            return
+        normalized = normalize_wallet_address(address)
+        if normalized is None:
+            await interaction.response.send_message(
+                "That is not a wallet address (`0x` plus 40 hex characters).",
+                ephemeral=True,
+            )
+            return
+        watch = bot.get_watch(guild.id, normalized)
+        if watch is None:
+            await interaction.response.send_message(
+                f"`{short_wallet_address(normalized)}` is not tracked in this "
+                "server. Add it with `/wallet add` first.",
+                ephemeral=True,
+            )
+            return
+        if watch.get("paused") is paused:
+            await interaction.response.send_message(
+                f"`{short_wallet_address(normalized)}` is already "
+                f"{'paused' if paused else 'active'}.",
+                ephemeral=True,
+            )
+            return
+        watch["paused"] = paused
+        if not paused:
+            # Resuming must not replay everything that happened while paused, so
+            # the next check only records a fresh baseline.
+            watch["last_seen_ts"] = 0.0
+        if not bot.set_watch(guild.id, watch):
+            await interaction.response.send_message(
+                "I couldn't save this server's watchlist.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"Wallet alerts for `{short_wallet_address(normalized)}` are now "
+            f"{'paused' if paused else 'active'}.",
+            ephemeral=True,
+        )
+
+
 class LashNewsBot(commands.Bot):
     def __init__(
         self,
@@ -1874,6 +2471,11 @@ class LashNewsBot(commands.Bot):
         self.monitor_state = load_monitor_state()
         self.seen_market_ids = set(self.monitor_state["seen_market_ids"])
         self.seen_trades = set(self.monitor_state["seen_trades"])
+        self.wallet_state = load_wallet_state()
+        self.last_wallet_check_at: datetime | None = None
+        self.last_wallet_error: str | None = None
+        self.last_wallet_activity_count = 0
+        self.wallet_alerts_sent = 0
         self.guild_seen_articles = load_guild_seen_articles()
         self.guild_seen_article_urls = {
             guild_id: set(urls)
@@ -1943,10 +2545,15 @@ class LashNewsBot(commands.Bot):
             self.set_price_alerts_slash,
             self.set_new_markets_slash,
             self.set_whale_alerts_slash,
+            self.set_wallet_alerts_slash,
             # Diagnostics and charting.
             self.config_check_slash,
             self.chart_slash,
         )
+        # /wallet is a command group, so it is added as a group rather than as a
+        # bound method: the group binds its own subcommands to itself.
+        self.wallet_group = WalletCommands(self)
+        self.tree.add_command(self.wallet_group)
         # Route unhandled application-command errors away from the library's
         # silent default so failures are logged and the user gets a reply.
         self.tree.on_error = self.on_app_command_error
@@ -2102,6 +2709,12 @@ class LashNewsBot(commands.Bot):
                 await self.news_task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                # A monitor that already died (or that never reached the gateway)
+                # must not turn a shutdown into a crash.
+                logger.exception(
+                    "The monitoring task ended with an error during shutdown."
+                )
         if self.news_session is not None:
             await self.news_session.close()
         await super().close()
@@ -2286,6 +2899,67 @@ class LashNewsBot(commands.Bot):
         if trade_keys:
             self.persist_monitor_state()
 
+    # ------------------------------------------------------------------
+    # Wallet watchlists
+    # ------------------------------------------------------------------
+
+    def wallet_guild_state(self, guild_id: int | str) -> dict[str, Any]:
+        """One server's watchlist entry, created in memory when absent."""
+        key = str(guild_id)
+        state = self.wallet_state.get(key)
+        if state is None or not isinstance(state.get("watches"), dict):
+            state = {"watches": {}}
+            self.wallet_state[key] = state
+        return state
+
+    def get_watch(self, guild_id: int | str, address: str) -> dict[str, Any] | None:
+        normalized = normalize_wallet_address(address)
+        if normalized is None:
+            return None
+        return self.wallet_guild_state(guild_id)["watches"].get(normalized)
+
+    def list_watches(self, guild_id: int | str) -> list[dict[str, Any]]:
+        watches = self.wallet_guild_state(guild_id)["watches"]
+        return sorted(watches.values(), key=lambda watch: watch["address"])
+
+    def tracked_wallet_addresses(self) -> set[str]:
+        """Every distinct address any server tracks, paused watches included."""
+        return {
+            address
+            for state in self.wallet_state.values()
+            for address in state.get("watches", {})
+        }
+
+    def guild_tracks_wallet(self, guild_id: int | str, address: Any) -> dict[str, Any] | None:
+        return self.get_watch(guild_id, address) if isinstance(address, str) else None
+
+    def save_wallets(self) -> bool:
+        try:
+            save_wallet_state(self.wallet_state)
+            return True
+        except OSError:
+            logger.exception("Could not save the wallet watchlist.")
+            return False
+
+    def watch_limit_reached(self, guild_id: int | str) -> bool:
+        return len(self.list_watches(guild_id)) >= MAX_TRACKED_WALLETS_PER_GUILD
+
+    def set_watch(self, guild_id: int | str, watch: dict[str, Any]) -> bool:
+        self.wallet_guild_state(guild_id)["watches"][watch["address"]] = watch
+        return self.save_wallets()
+
+    def drop_watch(self, guild_id: int | str, address: str) -> bool:
+        normalized = normalize_wallet_address(address)
+        if normalized is None:
+            return False
+        return self.wallet_guild_state(guild_id)["watches"].pop(normalized, None) is not None
+
+    def prune_empty_guild_wallets(self, guild_id: int | str) -> None:
+        key = str(guild_id)
+        state = self.wallet_state.get(key)
+        if state is not None and not state.get("watches"):
+            self.wallet_state.pop(key, None)
+
     async def send_embed(
         self,
         channel: discord.TextChannel | discord.Thread,
@@ -2447,6 +3121,7 @@ class LashNewsBot(commands.Bot):
         price="Alerts when a watched market's odds move sharply.",
         new_market="Alerts when new Polymarket markets are created.",
         whale="Alerts for large executed trades.",
+        wallet="Alerts when a tracked wallet moves.",
     )
     async def setup_slash(
         self,
@@ -2456,6 +3131,7 @@ class LashNewsBot(commands.Bot):
         price: bool | None = None,
         new_market: bool | None = None,
         whale: bool | None = None,
+        wallet: bool | None = None,
     ) -> None:
         guild = interaction.guild
         if not await self.require_admin(interaction) or guild is None:
@@ -2487,6 +3163,7 @@ class LashNewsBot(commands.Bot):
             ("price", price),
             ("new_market", new_market),
             ("whale", whale),
+            ("wallet", wallet),
         ):
             if value is not None:
                 settings["alerts"][alert] = value
@@ -2624,10 +3301,48 @@ class LashNewsBot(commands.Bot):
             for alert in ALERT_TYPES
             if settings["alerts"][alert]
         ) or "none"
+        wallet_check = (
+            discord.utils.format_dt(self.last_wallet_check_at, style="R")
+            if self.last_wallet_check_at is not None
+            else "not yet"
+        )
+        tracked_wallets = len(self.tracked_wallet_addresses())
+        configured_channels = len(
+            {
+                channel_id
+                for channel_id in (
+                    [effective_channel_id(settings, alert) for alert in ALERT_TYPES]
+                    + [effective_channel_id(settings)]
+                )
+                if channel_id is not None
+            }
+        )
+        # A connected Discord client says nothing about whether the monitors are
+        # alive, so every subsystem reports its own state.
         lines = [
             f"**Discord connection:** {'connected' if self.is_ready() else 'disconnected'}",
             f"**Commands synced:** {synced_at}",
-            f"**Monitoring:** {'running' if monitor_running else 'stopped'}",
+            f"**Monitor loop:** {'running' if monitor_running else 'stopped'}",
+            "**News polling:** "
+            + (
+                "configured (NewsAPI)"
+                if self.news_api_keys
+                else "disabled \u2014 NEWS_API_KEY is not set"
+            ),
+            "**Market-data polling:** "
+            + ("running" if monitor_running else "stopped"),
+            "**Wallet tracking:** "
+            + (
+                f"{tracked_wallets} wallet(s) tracked, last check {wallet_check}"
+                if tracked_wallets
+                else "no wallets tracked \u2014 use `/wallet add`"
+            ),
+            "**Alert delivery:** "
+            + (
+                f"{configured_channels} channel(s) configured"
+                if configured_channels
+                else "no channel configured \u2014 run `/setup`"
+            ),
             f"**Last successful check:** {last_check}",
             f"**Alert channel:** {channel.mention if channel is not None else 'not configured'}",
             f"**Enabled alerts:** {enabled}",
@@ -2645,6 +3360,8 @@ class LashNewsBot(commands.Bot):
             lines.append(f"**Latest issue:** {self.last_poll_error[:300]}")
         if self.last_sync_error:
             lines.append(f"**Command sync issue:** {self.last_sync_error[:200]}")
+        if self.last_wallet_error:
+            lines.append(f"**Wallet tracking issue:** {self.last_wallet_error[:200]}")
         await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
 
     @app_commands.command(
@@ -2739,6 +3456,15 @@ class LashNewsBot(commands.Bot):
             value="Market-driven news",
             inline=False,
         )
+        if alert == "wallet":
+            embed.add_field(
+                name="Wallet tracking",
+                value=(
+                    f"This server tracks {len(self.list_watches(guild.id))} "
+                    "wallet(s). Use `/wallet list` to review them."
+                ),
+                inline=False,
+            )
         embed.set_footer(text="Market Intel • Sovereign Predicts")
         try:
             await channel.send(
@@ -2891,6 +3617,22 @@ class LashNewsBot(commands.Bot):
         channel: discord.TextChannel | None = None,
     ) -> None:
         await self.apply_alert_channel(interaction, "whale", channel)
+
+    @app_commands.command(
+        name="set-wallet-alerts",
+        description="Send tracked-wallet alerts to their own channel in this server.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(
+        channel="Channel for wallet alerts; empty uses this server's default channel."
+    )
+    async def set_wallet_alerts_slash(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        await self.apply_alert_channel(interaction, "wallet", channel)
 
     @app_commands.command(
         name="config-check",
@@ -3385,20 +4127,29 @@ class LashNewsBot(commands.Bot):
     )
     async def help_slash(self, interaction: discord.Interaction) -> None:
         message = (
-            "**Sovereign Predicts — commands**\n"
-            "• `/setup channel:<#channel>` — administrators pick this server's "
-            "alert channel and toggle each alert type.\n"
-            "• `/alerts` — set the price-move, large-trade, and new-market "
-            "thresholds for this server.\n"
-            "• `/status` — monitoring health, last successful check, and this "
-            "server's settings.\n"
-            "• `/test` — send a test alert to the configured channel.\n"
-            "• `/sources` — show or configure which publishers this server "
-            "accepts.\n"
-            "• `/keywords` — view or manage include and exclude keywords.\n"
-            "• `/help` — show this command list.\n"
-            "• `/sync`, `/servers`, `/server-info` — owner only.\n"
-            "• `!status` and `!test` — legacy prefix commands."
+            "**Sovereign Predicts \u2014 commands**\n"
+            "**Alerts**\n"
+            "\u2022 `/setup` \u2014 administrators pick this server's alert channel "
+            "and toggle each alert type.\n"
+            "\u2022 `/alerts` \u2014 the price-move, large-trade, and new-market "
+            "thresholds.\n"
+            "\u2022 `/set-news-alerts`, `/set-price-alerts`, `/set-new-markets`, "
+            "`/set-whale-alerts`, `/set-wallet-alerts` \u2014 one category per "
+            "channel.\n"
+            "**Wallet watchlists**\n"
+            "\u2022 `/wallet add|remove|list|info|settings|pause|resume` \u2014 track "
+            "Polymarket wallets and choose what alerts.\n"
+            "**Monitoring**\n"
+            "\u2022 `/chart` \u2014 render a market's price history as a PNG.\n"
+            "\u2022 `/status` \u2014 per-subsystem health and this server's settings.\n"
+            "\u2022 `/test` \u2014 send a test alert to the configured channel.\n"
+            "\u2022 `/config-check` \u2014 report broken channels or permissions.\n"
+            "**Filters**\n"
+            "\u2022 `/sources` \u2014 which publishers this server accepts.\n"
+            "\u2022 `/keywords` \u2014 include and exclude keywords.\n"
+            "**Bot owner**\n"
+            "\u2022 `/sync`, `/servers`, `/server-info`.\n"
+            "\u2022 `!status` and `!test` \u2014 legacy prefix commands."
         )
         await interaction.response.send_message(message, ephemeral=True)
 
@@ -3674,6 +4425,7 @@ class LashNewsBot(commands.Bot):
             ("new markets", "new_market", self.run_new_market_cycle),
             ("price moves", "price", self.run_price_cycle),
             ("large trades", "whale", self.run_whale_cycle),
+            ("wallet activity", "wallet", self.run_wallet_cycle),
         )
         failures: list[str] = []
         attempted = 0
@@ -3792,17 +4544,30 @@ class LashNewsBot(commands.Bot):
         ))[:25]
 
         # ---- dedupe, filter by server settings, then correlate --------------
+        # Every article that does not become an alert is counted under the exact
+        # rule that dropped it, so a cycle that found news but posted nothing
+        # names the filter responsible instead of looking idle.
         correlated_articles: list[tuple[dict[str, Any], list[MarketMatch], list[str]]] = []
         lookup_failures = 0
         fingerprinted: set[str] = set()
         page_urls: set[str] = set()
+        skipped = {
+            "malformed": 0,
+            "duplicate_url": 0,
+            "server_filter": 0,
+            "duplicate_content": 0,
+            "no_market_match": 0,
+        }
         for article in raw_articles:
             if not isinstance(article, dict):
+                skipped["malformed"] += 1
                 continue
             url = article.get("url")
             if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+                skipped["malformed"] += 1
                 continue
             if url in page_urls:
+                skipped["duplicate_url"] += 1
                 continue
             page_urls.add(url)
             eligible_guilds = [
@@ -3812,12 +4577,14 @@ class LashNewsBot(commands.Bot):
                 and self.guild_accepts_article(guild_id, article)
             ]
             if not eligible_guilds:
+                skipped["server_filter"] += 1
                 continue
 
             # Persist a content fingerprint so near-identical copies and minor
             # headline variants do not replay as new alerts.
             fp = article_fingerprint(article)
             if fp and fp in fingerprinted:
+                skipped["duplicate_content"] += 1
                 continue
             if fp:
                 fingerprinted.add(fp)
@@ -3834,6 +4601,7 @@ class LashNewsBot(commands.Bot):
                 )
                 continue
             if not match_list:
+                skipped["no_market_match"] += 1
                 continue
             correlated_articles.append((article, match_list, eligible_guilds))
 
@@ -3855,15 +4623,31 @@ class LashNewsBot(commands.Bot):
                 posted_count += 1
 
         logger.info(
-            "News check complete: %d results, %d new articles checked, "
-            "%d correlated with active markets, %d posted across servers, "
-            "%d correlation failures.",
-            len(raw_articles),
+            "News check complete: %d article(s) returned, %d correlated with an "
+            "active market, %d posted across servers, %d correlation failure(s), "
+            "rejected: %s.",
             len(raw_articles),
             len(correlated_articles),
             posted_count,
             lookup_failures,
+            ", ".join(f"{name}={count}" for name, count in skipped.items()),
         )
+        if not raw_articles:
+            logger.warning(
+                "NewsAPI returned no articles for this cycle. The generated query "
+                "was %d characters; check the key's plan and daily request limit, "
+                "and the query terms (last terms: %s).",
+                len(news_query),
+                ", ".join(self.last_search_terms[:8]) or "none",
+            )
+        elif not correlated_articles:
+            logger.warning(
+                "NewsAPI returned %d article(s) but none correlated with an active "
+                "market at the current thresholds (correlation >= %d and a direct "
+                "or strong indirect relationship), so nothing was posted.",
+                len(raw_articles),
+                MIN_CORRELATION_FOR_ALERT,
+            )
 
     @staticmethod
     def market_page_url(slug: Any) -> str:
@@ -4019,6 +4803,254 @@ class LashNewsBot(commands.Bot):
         if size is None or price is None:
             return None
         return size * price
+
+
+    def guild_accepts_wallet_event(
+        self, watch: dict[str, Any], event: dict[str, Any]
+    ) -> bool:
+        """Apply one watch's activity-type and value filters."""
+        activity_filter = watch.get("activity_filter", "all")
+        if activity_filter == "trades" and wallet_activity_type(event) != "TRADE":
+            return False
+        threshold = as_float(watch.get("min_usd")) or 0.0
+        if threshold <= 0:
+            return True
+        value = wallet_event_value(event)
+        return value is not None and value >= threshold
+
+    async def fetch_wallet_activity(self, address: str) -> list[dict[str, Any]]:
+        """One descending page of a wallet's most recent activity rows."""
+        payload = await self.get_json(
+            POLYMARKET_WALLET_ACTIVITY_URL,
+            params={
+                "user": address,
+                "limit": WALLET_ACTIVITY_PAGE_SIZE,
+                "sortBy": "TIMESTAMP",
+                "sortDirection": "DESC",
+            },
+            headers={"Accept": "application/json", "User-Agent": "LashNewsBot/1.0"},
+            timeout=15,
+        )
+        if isinstance(payload, dict):
+            payload = payload.get("data")
+        if not isinstance(payload, list):
+            raise RuntimeError(
+                "Polymarket returned an unexpected wallet activity response."
+            )
+        return [event for event in payload if isinstance(event, dict)]
+
+    async def run_wallet_cycle(
+        self,
+        destinations: dict[str, discord.TextChannel | discord.Thread],
+    ) -> None:
+        """Alert on new activity for every wallet a server watches.
+
+        Each distinct address is fetched once per cycle however many servers
+        track it, and the address count is hard-capped so a large watchlist can
+        never turn one cycle into an unbounded burst of API calls. The first
+        poll of a newly added wallet only records a baseline, so adding a busy
+        wallet does not dump its history into the channel.
+        """
+        watches_by_guild: dict[str, list[dict[str, Any]]] = {}
+        for guild_id in destinations:
+            if not self.get_settings(guild_id)["alerts"].get("wallet", True):
+                continue
+            watches = self.list_watches(guild_id)
+            if watches:
+                watches_by_guild[guild_id] = watches
+        if not watches_by_guild:
+            self.last_wallet_check_at = datetime.now(timezone.utc)
+            self.last_wallet_error = None
+            return
+
+        addresses = sorted(
+            {
+                watch["address"]
+                for watches in watches_by_guild.values()
+                for watch in watches
+            }
+        )
+        if len(addresses) > MAX_WALLET_ADDRESSES_PER_CYCLE:
+            logger.warning(
+                "The watchlist has %d distinct wallets; only the first %d are "
+                "checked this cycle.",
+                len(addresses),
+                MAX_WALLET_ADDRESSES_PER_CYCLE,
+            )
+            addresses = addresses[:MAX_WALLET_ADDRESSES_PER_CYCLE]
+
+        events_by_address: dict[str, list[dict[str, Any]]] = {}
+        failures = 0
+        for address in addresses:
+            try:
+                events_by_address[address] = await self.fetch_wallet_activity(address)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failures += 1
+                events_by_address[address] = []
+                logger.warning(
+                    "Wallet activity lookup failed for %s: %s",
+                    short_wallet_address(address),
+                    exc,
+                )
+
+        self.last_wallet_activity_count = sum(
+            len(events) for events in events_by_address.values()
+        )
+        alerted = 0
+        posted_by_guild: dict[str, int] = {}
+        for guild_id, watches in watches_by_guild.items():
+            channel = destinations.get(guild_id)
+            if channel is None:
+                continue
+            for watch in watches:
+                if watch.get("paused"):
+                    continue
+                events = events_by_address.get(watch["address"]) or []
+                if not events:
+                    continue
+                timestamps = [
+                    value
+                    for value in (as_float(event.get("timestamp")) for event in events)
+                    if value is not None
+                ]
+                newest = max(timestamps) if timestamps else 0.0
+                since = as_float(watch.get("last_seen_ts")) or 0.0
+                if since <= 0:
+                    watch["last_seen_ts"] = newest
+                    continue
+                seen = list(dict.fromkeys(watch.get("seen") or []))
+                seen_set = set(seen)
+                for event in sorted(
+                    events,
+                    key=lambda item: as_float(item.get("timestamp")) or 0.0,
+                ):
+                    timestamp = as_float(event.get("timestamp")) or 0.0
+                    if timestamp <= since:
+                        continue
+                    key = wallet_activity_key(event)
+                    if key is not None:
+                        if key in seen_set:
+                            continue
+                        seen_set.add(key)
+                        seen.append(key)
+                    if not self.guild_accepts_wallet_event(watch, event):
+                        continue
+                    if posted_by_guild.get(guild_id, 0) >= MAX_ALERTS_PER_CYCLE:
+                        continue
+                    embed = self.make_wallet_embed(event, watch)
+                    if await self.send_embed(channel, embed, guild_id):
+                        posted_by_guild[guild_id] = posted_by_guild.get(guild_id, 0) + 1
+                        alerted += 1
+                        self.wallet_alerts_sent += 1
+                watch["seen"] = seen[-MAX_WALLET_SEEN_EVENTS:]
+                if newest > since:
+                    watch["last_seen_ts"] = newest
+
+        self.save_wallets()
+        self.last_wallet_check_at = datetime.now(timezone.utc)
+        self.last_wallet_error = (
+            f"{failures} of {len(addresses)} wallet lookups failed" if failures else None
+        )
+        logger.info(
+            "Wallet check complete: %d wallet(s) polled, %d activity row(s) seen, "
+            "%d alert(s) posted, %d lookup failure(s).",
+            len(addresses),
+            self.last_wallet_activity_count,
+            alerted,
+            failures,
+        )
+
+    def whale_alert_is_duplicate(self, guild_id: str, wallet: Any) -> bool:
+        """True when this server already gets a wallet alert for the same fill.
+
+        A tracked wallet's large fill would otherwise post twice: once through
+        the global whale monitor and once through the wallet monitor. The
+        per-watch ``suppress_whale`` flag (on by default) turns the whale copy
+        off; setting it to false keeps both.
+        """
+        if not isinstance(wallet, str):
+            return False
+        watch = self.get_watch(guild_id, wallet)
+        if watch is None or watch.get("paused"):
+            return False
+        if not self.get_settings(guild_id)["alerts"].get("wallet", True):
+            return False
+        return bool(watch.get("suppress_whale", True))
+
+    def make_wallet_embed(
+        self, event: dict[str, Any], watch: dict[str, Any]
+    ) -> discord.Embed:
+        """Build the tracked-wallet alert embed for one activity row."""
+        address = watch["address"]
+        label = watch.get("label") or short_wallet_address(address)
+        activity_type = wallet_activity_type(event)
+        title = clean_article_text(event.get("title")) or "Polymarket market"
+        outcome = clean_article_text(event.get("outcome")) or "unknown outcome"
+        side = clean_article_text(event.get("side")).upper()
+        value = wallet_event_value(event)
+        size = as_float(event.get("size"))
+        price = as_float(event.get("price"))
+        transaction = event.get("transactionHash") or event.get("transaction_hash")
+        timestamp = as_float(event.get("timestamp"))
+        occurred_at = (
+            datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            if timestamp
+            else datetime.now(timezone.utc)
+        )
+
+        if activity_type == "TRADE" and side == "SELL":
+            color = WHALE_SELL_COLOR
+        elif activity_type == "TRADE":
+            color = WHALE_BUY_COLOR
+        else:
+            color = SOVEREIGN_COLOR
+
+        headline = (
+            f"{side} {outcome}".strip()
+            if activity_type == "TRADE"
+            else activity_type.title()
+        )
+        embed = discord.Embed(
+            title=f"\U0001F441 Tracked wallet | {label}",
+            description=(
+                f"**{headline}** on {title[:250]}\n\n"
+                f"[Open this market]({wallet_event_market_url(event)})"
+            ),
+            color=color,
+            timestamp=occurred_at,
+        )
+        if value is not None:
+            embed.add_field(
+                name="Transaction value", value=f"${value:,.2f}", inline=True
+            )
+        if size is not None:
+            embed.add_field(name="Size", value=f"{size:,.2f} shares", inline=True)
+        if price is not None:
+            embed.add_field(name="Price", value=f"{price:.3f}", inline=True)
+        embed.add_field(name="Activity", value=activity_type.title(), inline=True)
+        embed.add_field(
+            name="Wallet",
+            value=f"`{short_wallet_address(address)}`",
+            inline=True,
+        )
+        if transaction:
+            embed.add_field(
+                name="Transaction",
+                value=f"[View on Polygonscan]({POLYGON_EXPLORER_TX}/{transaction})",
+                inline=True,
+            )
+        embed.add_field(
+            name="Scope",
+            value=(
+                "Value of this single activity row. It is not the wallet's total "
+                "position, ownership, or intent."
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="Market Intel \u2022 Sovereign Predicts")
+        return embed
 
     async def run_new_market_cycle(
         self,
@@ -4212,10 +5244,14 @@ class LashNewsBot(commands.Bot):
             notional = self.trade_notional(trade)
             if notional is None:
                 continue
+            wallet = trade.get("proxy_wallet") or trade.get("proxyWallet")
             eligible = [
                 (guild_id, channel)
                 for guild_id, channel, threshold in tracked
                 if notional >= threshold
+                # A wallet this server already tracks gets its own, more
+                # detailed wallet alert, so the whale copy is suppressed.
+                and not self.whale_alert_is_duplicate(guild_id, wallet)
             ]
             if not eligible or posted >= MAX_ALERTS_PER_CYCLE:
                 continue

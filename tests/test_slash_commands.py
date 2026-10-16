@@ -24,6 +24,9 @@ EXPECTED_COMMANDS = {
     "servers", "server-info", "sync",
     # Per-category channel configuration.
     "set-news-alerts", "set-price-alerts", "set-new-markets", "set-whale-alerts",
+    "set-wallet-alerts",
+    # Wallet watchlists (a command group with subcommands).
+    "wallet",
     # Diagnostics and charting.
     "config-check", "chart",
 }
@@ -32,13 +35,17 @@ GUILD_ONLY = {
     "setup", "alerts", "status", "test", "sources", "keywords",
     "sync", "server-info",
     "set-news-alerts", "set-price-alerts", "set-new-markets", "set-whale-alerts",
+    "set-wallet-alerts", "wallet",
     "config-check", "chart",
 }
 # Commands that only server administrators may run by default.
 ADMIN_ONLY = {
     "setup", "alerts", "sources", "keywords",
     "set-news-alerts", "set-price-alerts", "set-new-markets", "set-whale-alerts",
+    "set-wallet-alerts",
 }
+# Every registered top-level command that is a group, with its subcommands.
+EXPECTED_GROUPS = {"wallet": {"add", "remove", "list", "info", "settings", "pause", "resume"}}
 
 
 class FakeResponse:
@@ -140,6 +147,19 @@ class CommandRegistrationTests(BotTestCase):
             names = [c.name for c in bot.tree.get_commands()]
             self.assertEqual(len(names), len(set(names)), f"duplicate names: {names}")
             self.assertEqual(set(names), EXPECTED_COMMANDS)
+        finally:
+            await bot.close()
+
+    async def test_group_subcommands_are_registered(self):
+        bot = await self._build_bot()
+        try:
+            await bot.setup_hook()
+            groups = {
+                command.name: {child.name for child in command.commands}
+                for command in bot.tree.get_commands()
+                if isinstance(command, app_commands.Group)
+            }
+            self.assertEqual(groups, EXPECTED_GROUPS)
         finally:
             await bot.close()
 
@@ -260,6 +280,23 @@ class CommandInvocationTests(BotTestCase):
             commands = bot.tree.get_commands()
             self.assertEqual(len(commands), len(EXPECTED_COMMANDS))
             for command in commands:
+                if isinstance(command, app_commands.Group):
+                    # A group binds its own children to itself, so the group
+                    # holds the bot as an attribute instead of as a binding.
+                    self.assertIs(
+                        command.bot,
+                        bot,
+                        f"/{command.name} has no bot, so its subcommands "
+                        f"cannot respond",
+                    )
+                    for child in command.commands:
+                        self.assertIs(
+                            child.binding,
+                            command,
+                            f"/{command.name} {child.name} is not bound to its "
+                            f"group, so its callback would omit self",
+                        )
+                    continue
                 self.assertIs(
                     command.binding,
                     bot,
@@ -301,7 +338,13 @@ class CommandInvocationTests(BotTestCase):
         bot = await self._build_bot()
         try:
             await bot.setup_hook()
+            callbacks = []
             for command in bot.tree.get_commands():
+                if isinstance(command, app_commands.Group):
+                    callbacks.extend(command.commands)
+                else:
+                    callbacks.append(command)
+            for command in callbacks:
                 parameters = list(inspect.signature(command._callback).parameters)
                 if parameters and parameters[0] == "self":
                     self.assertIsNotNone(

@@ -8,6 +8,9 @@ venv/
 node_modules/
 tests/__pycache__/
 
+# Local Railway secret values (not committed).
+.env.railway.secret
+
 # Session working artifacts (not part of the project).
 HANDOFF.md
 handoff.patch
