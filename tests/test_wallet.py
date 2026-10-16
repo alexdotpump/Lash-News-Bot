@@ -556,6 +556,38 @@ class WhaleDuplicateSuppressionTests(WalletTestCase):
         self.assertEqual(len(channel.embeds), 1)
 
 
+class GuildScopedWalletGroupTests(WalletTestCase):
+    """A guild copy of the /wallet group must still reach the bot.
+
+    `tree.copy_global_to` rebuilds the group and re-binds its children to the
+    copy, so the copy has to keep the bot reference or every server-scoped
+    /wallet subcommand would be called without a usable self.
+    """
+
+    async def test_a_guild_copy_of_the_group_still_reaches_the_bot(self):
+        import discord
+
+        bot = await self._bot()
+        guild = discord.Object(id=GUILD)
+        bot.tree.copy_global_to(guild=guild)
+
+        copied = bot.tree.get_command("wallet", guild=guild)
+        self.assertIsInstance(copied, app_commands.Group)
+        self.assertIs(copied.bot, bot)
+        add = copied.get_command("add")
+        self.assertIs(add.binding, copied)
+
+        interaction = await self._call_on(
+            add, FakeInteraction(), address=ADDRESS, label="Copied"
+        )
+        self.assertIn("Tracking", interaction.text)
+        self.assertIsNotNone(bot.get_watch(GUILD, ADDRESS))
+
+    async def _call_on(self, command, interaction, **params):
+        await command._do_call(interaction, params)
+        return interaction
+
+
 class WalletChannelTests(WalletTestCase):
     async def test_the_wallet_category_can_use_its_own_channel(self):
         settings = main.normalize_guild_settings(

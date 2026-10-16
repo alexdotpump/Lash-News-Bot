@@ -342,6 +342,39 @@ class NewsProviderTests(unittest.IsolatedAsyncioTestCase):
             await adapter.fetch_articles("test")
         self.assertIn("rate limited", str(ctx.exception))
 
+    async def test_a_rejected_key_is_never_written_to_the_logs(self):
+        """A credential must not leak into the logs when a request fails."""
+
+        async def request_json(url, params=None, headers=None):
+            if headers["X-Api-Key"] == "super-secret-primary":
+                raise RuntimeError("HTTP 429")
+            return {"status": "ok", "articles": []}
+
+        adapter = main.NewsAPIAdapter(
+            None,
+            api_key="super-secret-primary",
+            api_keys=["backup"],
+            request_json=request_json,
+        )
+        with self.assertLogs("lash-news-bot", level="WARNING") as logs:
+            await adapter.fetch_articles("q")
+        self.assertTrue(logs.output, "a rejected key must be reported")
+        for line in logs.output:
+            self.assertNotIn("super-secret-primary", line)
+
+    def test_a_missing_news_key_is_an_actionable_startup_warning(self):
+        previous = os.environ.pop("NEWS_API_KEY", None)
+        try:
+            with self.assertLogs("lash-news-bot", level="WARNING") as logs:
+                bot = main.create_bot()
+            message = "\n".join(logs.output)
+            self.assertIn("NEWS_API_KEY", message)
+            self.assertIn("news", message.lower())
+            self.assertEqual(bot.news_api_keys, [])
+        finally:
+            if previous is not None:
+                os.environ["NEWS_API_KEY"] = previous
+
     async def test_a_throttled_key_falls_through_to_the_next(self):
         attempts: list[str] = []
 
