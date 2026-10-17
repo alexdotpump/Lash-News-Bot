@@ -115,13 +115,14 @@ KNOWN_WALLET_ACTIVITY_TYPES = (
     "CONVERSION",
 )
 WALLET_BUY_ACTIVITY_TYPES = ("TRADE",)
-ALERT_TYPES = ("news", "price", "new_market", "whale", "wallet")
+ALERT_TYPES = ("news", "price", "new_market", "whale", "wallet", "x")
 ALERT_LABELS = {
     "news": "News alerts",
     "price": "Price alerts",
     "new_market": "New market alerts",
     "whale": "Whale alerts",
     "wallet": "Wallet alerts",
+    "x": "X (Twitter) alerts",
 }
 # The slash command that points one alert category at its own channel.
 ALERT_CHANNEL_COMMANDS = {
@@ -130,6 +131,7 @@ ALERT_CHANNEL_COMMANDS = {
     "new_market": "/set-new-markets",
     "whale": "/set-whale-alerts",
     "wallet": "/set-wallet-alerts",
+    "x": "/set-x-alerts",
 }
 
 
@@ -252,6 +254,49 @@ MIN_CORRELATION_FOR_DIAGNOSTICS = min(
     MIN_CORRELATION_FOR_DIAGNOSTICS, MIN_CORRELATION_FOR_ALERT
 )
 MAX_RELATED_MARKETS = 3
+
+# ---------------------------------------------------------------------------
+# X/Twitter account tracking configuration
+# ---------------------------------------------------------------------------
+# The tracker polls the official X API v2 (pay-per-use) with an app-only
+# bearer token. GET /2/users/:id/tweets with a per-account since_id returns
+# only posts newer than the last one delivered, so a quiet account costs
+# nothing between posts (X bills per post resource returned) and a restart
+# never replays old posts. The X Activity API push stream is a possible later
+# upgrade; polling keeps the failure modes simple and the spend visible.
+X_API_BASE_URL = "https://api.x.com/2"
+X_PROFILE_URL = "https://x.com"
+X_TRACKED_FILE = STATE_DIR / "x_tracked.json"
+# X handles are 1-15 characters of letters, digits and underscores. A display
+# name is never proof of identity: the handle resolves to a numeric user id,
+# and the id is what the API is queried with.
+X_USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+MAX_TRACKED_X_ACCOUNTS_PER_GUILD = 25
+MAX_X_ACCOUNTS_PER_CYCLE = 50
+# The user-timeline endpoint's minimum page size is 5; only new posts are
+# requested via since_id, so a larger page just absorbs a burst.
+MAX_X_POSTS_PER_POLL = 5
+MAX_X_SEEN_POSTS = 200
+MAX_X_LABEL_LENGTH = 40
+MAX_X_KEYWORDS_PER_ACCOUNT = 25
+MAX_X_ALERTS_PER_CYCLE = 10
+X_POLL_INTERVAL_SECONDS = _env_int("X_POLL_INTERVAL_SECONDS", 120, 60, 3600)
+# "all" delivers every activity type the API reports. The narrower filters
+# drop exactly what they name: "originals" keeps only original posts, and
+# "no_replies" keeps everything except replies.
+X_ACTIVITY_FILTERS = ("all", "originals", "no_replies")
+X_ACTIVITY_FILTER_LABELS = {
+    "all": "All activity (posts, replies, quotes, reposts)",
+    "originals": "Original posts only",
+    "no_replies": "Everything except replies",
+}
+# Human labels for the activity types identified from referenced_tweets.
+X_ACTIVITY_TYPE_LABELS = {
+    "post": "New post",
+    "reply": "Reply",
+    "quote": "Quote post",
+    "repost": "Repost",
+}
 
 # Discord's hard embed limits. Exceeding any of them rejects the whole message
 # with "Invalid Form Body", which would silently drop an alert, so every embed is
@@ -2141,6 +2186,295 @@ def save_wallet_state(state: dict[str, dict[str, Any]]) -> None:
     write_json_atomically(WALLETS_FILE, state)
 
 
+# ---------------------------------------------------------------------------
+# X/Twitter account watchlist storage
+# ---------------------------------------------------------------------------
+
+
+class XApiError(RuntimeError):
+    """An X API failure, carrying the HTTP status and a user-safe message.
+
+    ``transient`` distinguishes "try again next cycle" (rate limits, 5xx,
+    network trouble, or the account not being resolvable right now) from a
+    persistent problem the operator must fix (an invalid API token) or a
+    permanent per-account condition (account not found).
+    """
+
+    def __init__(
+        self, status: int | None, message: str, *, transient: bool = True
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.transient = transient
+
+
+def normalize_x_username(value: Any) -> str | None:
+    """Return the canonical lower-case handle, or None when it is not one.
+
+    Accepts ``@name``, ``name`` and ``https://x.com/name`` forms. X handles
+    are 1-15 characters of letters, digits and underscores; anything else is
+    rejected instead of stored as something the API can never resolve.
+    """
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    url_match = re.search(
+        r"(?:https?://)?(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/?\s*$",
+        candidate,
+        re.IGNORECASE,
+    )
+    if url_match:
+        candidate = url_match.group(1)
+    candidate = candidate[1:] if candidate.startswith("@") else candidate
+    candidate = candidate.strip()
+    if not X_USERNAME_PATTERN.fullmatch(candidate):
+        return None
+    return candidate.lower()
+
+
+def default_x_account(username: str) -> dict[str, Any]:
+    """The full shape of one tracked X account (always the same keys)."""
+    return {
+        "username": username,
+        # The numeric user id is the account's stable identity; a handle can
+        # be renamed but the id never changes. Empty until first resolved.
+        "user_id": "",
+        "display_name": "",
+        "profile_image_url": "",
+        "label": "",
+        "paused": False,
+        "activity_filter": "all",
+        "include_keywords": [],
+        "exclude_keywords": [],
+        # Optional per-account channel override; None uses the server's
+        # x-alert channel (or its default channel).
+        "channel_id": None,
+        # Snowflake of the newest post already handled. X returns only posts
+        # newer than this, so restarts never replay history.
+        "since_id": "",
+        "seen": [],
+        "last_success_ts": 0.0,
+        "last_error": "",
+    }
+
+
+def normalize_x_account(username: Any, raw: Any) -> dict[str, Any] | None:
+    """Coerce one stored account into a known-good shape, or drop it."""
+    normalized = normalize_x_username(username)
+    if normalized is None:
+        return None
+    account = default_x_account(normalized)
+    if not isinstance(raw, dict):
+        return account
+
+    # Keep the stored handle's original casing for display.
+    stored_handle = raw.get("username")
+    if isinstance(stored_handle, str) and stored_handle.strip():
+        account["username"] = stored_handle.strip().lstrip("@")[:15]
+    user_id = raw.get("user_id")
+    if isinstance(user_id, str) and user_id.isdigit():
+        account["user_id"] = user_id
+    for key in ("display_name", "profile_image_url"):
+        value = clean_article_text(raw.get(key))[:200]
+        if value:
+            account[key] = value
+    label = clean_article_text(raw.get("label"))[:MAX_X_LABEL_LENGTH].strip()
+    if label:
+        account["label"] = label
+    if isinstance(raw.get("paused"), bool):
+        account["paused"] = raw["paused"]
+    activity_filter = raw.get("activity_filter")
+    if isinstance(activity_filter, str) and activity_filter in X_ACTIVITY_FILTERS:
+        account["activity_filter"] = activity_filter
+    for key in ("include_keywords", "exclude_keywords"):
+        values = raw.get(key)
+        if isinstance(values, list):
+            account[key] = dedupe_strings(values)[:MAX_X_KEYWORDS_PER_ACCOUNT]
+    channel_id = raw.get("channel_id")
+    if (
+        isinstance(channel_id, int)
+        and not isinstance(channel_id, bool)
+        and channel_id > 0
+    ):
+        account["channel_id"] = channel_id
+    since_id = raw.get("since_id")
+    if isinstance(since_id, (str, int)) and str(since_id).isdigit():
+        account["since_id"] = str(since_id)
+    seen = raw.get("seen")
+    if isinstance(seen, list):
+        account["seen"] = [
+            str(value)
+            for value in seen
+            if isinstance(value, (str, int)) and str(value).isdigit()
+        ][-MAX_X_SEEN_POSTS:]
+    success = as_float(raw.get("last_success_ts"))
+    if success is not None and success >= 0:
+        account["last_success_ts"] = success
+    last_error = clean_article_text(raw.get("last_error"))[:200]
+    if last_error:
+        account["last_error"] = last_error
+    return account
+
+
+def normalize_x_state(raw: Any) -> dict[str, dict[str, Any]]:
+    """Coerce the whole x-tracked file; a corrupt entry never breaks startup."""
+    state: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return state
+    for guild_id, guild_raw in raw.items():
+        if not isinstance(guild_id, str) or not guild_id.isdigit():
+            continue
+        accounts_raw = (
+            guild_raw.get("accounts") if isinstance(guild_raw, dict) else None
+        )
+        if not isinstance(accounts_raw, dict):
+            continue
+        accounts: dict[str, dict[str, Any]] = {}
+        for username, raw_account in accounts_raw.items():
+            account = normalize_x_account(username, raw_account)
+            if account is not None:
+                accounts[account["username"].casefold()] = account
+        state[guild_id] = {"accounts": accounts}
+    return state
+
+
+def load_x_state() -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(X_TRACKED_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not read the X watchlist file; starting fresh.")
+        return {}
+    return normalize_x_state(data)
+
+
+def save_x_state(state: dict[str, dict[str, Any]]) -> None:
+    write_json_atomically(X_TRACKED_FILE, state)
+
+
+def x_post_activity(post: dict[str, Any]) -> str:
+    """Classify one post as post / reply / quote / repost from its references."""
+    refs = post.get("referenced_tweets")
+    kinds = (
+        {ref.get("type") for ref in refs if isinstance(ref, dict)}
+        if isinstance(refs, list)
+        else set()
+    )
+    if "retweeted" in kinds:
+        return "repost"
+    if "quoted" in kinds:
+        return "quote"
+    if "replied_to" in kinds:
+        return "reply"
+    return "post"
+
+
+def x_post_is_newer(post_id: Any, since_id: str) -> bool:
+    """True when this snowflake is newer than the stored high-water mark.
+
+    X post ids are snowflakes: numeric strings that grow over time, so the
+    comparison is integer, not lexicographic ("9" sorts after "10" as text).
+    """
+    if not isinstance(post_id, str) or not post_id.isdigit():
+        return False
+    if not since_id:
+        return True
+    try:
+        return int(post_id) > int(since_id)
+    except ValueError:
+        return True
+
+
+def x_post_passes_filters(
+    account: dict[str, Any], post: dict[str, Any], activity: str
+) -> bool:
+    """Apply one account's activity and keyword filters to one post.
+
+    Filters run on the retrieved post text (the X API has no server-side
+    keyword filtering for timelines). Excluded words always win; when include
+    keywords exist, at least one must appear. Matching is case-insensitive
+    substring matching, so "$btc" and "btc" both match "BTC".
+    """
+    activity_filter = account.get("activity_filter", "all")
+    if activity_filter == "originals" and activity != "post":
+        return False
+    if activity_filter == "no_replies" and activity == "reply":
+        return False
+
+    text = clean_article_text(post.get("text")).casefold()
+    excludes = [
+        keyword.casefold() for keyword in account.get("exclude_keywords") or []
+    ]
+    if any(word in text for word in excludes):
+        return False
+    includes = [
+        keyword.casefold() for keyword in account.get("include_keywords") or []
+    ]
+    if includes and not any(word in text for word in includes):
+        return False
+    return True
+
+
+def x_cashtag_symbols(text: str) -> list[str]:
+    """Distinct $TICKER symbols mentioned in a post, in first-seen order.
+
+    A cashtag is a cheap, factual hint that a post concerns a token. It is
+    used only to offer Polymarket search links; it never claims the post
+    predicts or moves any market.
+    """
+    seen: list[str] = []
+    for match in re.finditer(r"\$([A-Za-z]{2,10})\b", text or ""):
+        symbol = match.group(1).upper()
+        if symbol not in seen:
+            seen.append(symbol)
+    return seen[:6]
+
+
+def parse_keyword_list(raw: str | None) -> list[str] | None:
+    """Split a comma/semicolon-separated keyword string, or None when empty."""
+    if not raw:
+        return None
+    values = dedupe_strings(re.split(r"[,;]", raw))
+    return values or None
+
+
+def apply_x_account_options(
+    account: dict[str, Any],
+    *,
+    label: str | None = None,
+    activity_filter: str | None = None,
+    include_keywords: list[str] | None = None,
+    exclude_keywords: list[str] | None = None,
+    channel: Any = None,
+) -> dict[str, Any]:
+    """Apply the options a command provided; None means "leave unchanged"."""
+    if label is not None:
+        account["label"] = label.strip()[:MAX_X_LABEL_LENGTH]
+    if activity_filter is not None and activity_filter in X_ACTIVITY_FILTERS:
+        account["activity_filter"] = activity_filter
+    if include_keywords is not None:
+        account["include_keywords"] = include_keywords[:MAX_X_KEYWORDS_PER_ACCOUNT]
+    if exclude_keywords is not None:
+        account["exclude_keywords"] = exclude_keywords[:MAX_X_KEYWORDS_PER_ACCOUNT]
+    if channel is not None:
+        account["channel_id"] = getattr(channel, "id", None)
+    return account
+
+
+def describe_x_account(account: dict[str, Any]) -> str:
+    """One readable line for a tracked account."""
+    handle = f"@{account['username']}"
+    label = clean_article_text(account.get("label"))
+    name = (
+        f" (`{label}`)"
+        if label and label.casefold() != account["username"].casefold()
+        else ""
+    )
+    state = " [paused]" if account.get("paused") else ""
+    return f"**{handle}**{name}{state}"
+
+
 def wallet_activity_type(event: dict[str, Any]) -> str:
     return clean_article_text(
         event.get("type") or event.get("activityType")
@@ -2698,6 +3032,521 @@ class WalletCommands(app_commands.Group):
         )
 
 
+class XCommands(app_commands.Group):
+    """The /xtrack command group for X/Twitter account monitoring.
+
+    Same shape as /wallet: a discord.py group owns its children, so every
+    subcommand lives on the group and reaches the bot through ``self.bot``.
+    """
+
+    def __init__(self, bot: "LashNewsBot") -> None:
+        self.bot = bot
+        super().__init__(
+            name="xtrack",
+            description="Track X (Twitter) accounts and alert on their posts.",
+            guild_only=True,
+        )
+
+    @staticmethod
+    def _clear_sentinel(value: str | None) -> bool:
+        """True when a settings string means "remove the current list"."""
+        return isinstance(value, str) and value.strip().casefold() in {
+            "clear",
+            "none",
+            "reset",
+        }
+
+    @app_commands.command(
+        name="add",
+        description="Track an X account and alert on its new posts here.",
+    )
+    @app_commands.describe(
+        username="The X handle to track (@name, name, or an x.com profile link).",
+        label="A nickname shown in alerts (optional).",
+        channel="Post this account's alerts to a specific channel (optional).",
+        activity="Which activity should generate an alert.",
+        keywords="Comma-separated; only posts containing one of them alert (optional).",
+        exclude="Comma-separated; posts containing one of them are skipped (optional).",
+    )
+    @app_commands.choices(
+        activity=[
+            app_commands.Choice(name=X_ACTIVITY_FILTER_LABELS[key], value=key)
+            for key in X_ACTIVITY_FILTERS
+        ]
+    )
+    async def add(
+        self,
+        interaction: discord.Interaction,
+        username: str,
+        label: str | None = None,
+        channel: discord.TextChannel | None = None,
+        activity: app_commands.Choice[str] | None = None,
+        keywords: str | None = None,
+        exclude: str | None = None,
+    ) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if not await bot.require_admin(interaction) or guild is None:
+            return
+        normalized = normalize_x_username(username)
+        if normalized is None:
+            await interaction.response.send_message(
+                "That is not an X handle. Send the 1-15 character handle "
+                "(letters, digits, underscores), for example "
+                "`@VitalikButerin`.",
+                ephemeral=True,
+            )
+            return
+        if not bot.x_api_bearer:
+            await interaction.response.send_message(
+                "X tracking is not configured on this bot: the hosting "
+                "environment is missing the X_API_BEARER_TOKEN variable, so "
+                "handles cannot be resolved to accounts. Nothing was added.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        if bot.get_x_account(guild.id, normalized) is not None:
+            await interaction.followup.send(
+                f"`@{normalized}` is already tracked in this server. Use "
+                "`/xtrack info` to see it or `/xtrack settings` to change it.",
+                ephemeral=True,
+            )
+            return
+        if bot.x_limit_reached(guild.id):
+            await interaction.followup.send(
+                f"This server already tracks the maximum of "
+                f"{MAX_TRACKED_X_ACCOUNTS_PER_GUILD} X accounts. Remove one "
+                "with `/xtrack remove` first.",
+                ephemeral=True,
+            )
+            return
+
+        account = default_x_account(normalized)
+        apply_x_account_options(
+            account,
+            label=label,
+            activity_filter=activity.value if activity is not None else None,
+            include_keywords=parse_keyword_list(keywords),
+            exclude_keywords=parse_keyword_list(exclude),
+            channel=channel,
+        )
+
+        note = ""
+        try:
+            user = await bot.fetch_x_user(normalized)
+        except XApiError as exc:
+            if not exc.transient:
+                await interaction.followup.send(str(exc), ephemeral=True)
+                return
+            # A transient failure (rate limit, X outage) still tracks the
+            # account; the monitoring cycle resolves the handle on its next
+            # pass instead of forcing the administrator to try again.
+            note = (
+                "\nX could not be reached to confirm the account just now; "
+                "it is tracked and will be resolved on the next cycle."
+            )
+        else:
+            account["user_id"] = str(user.get("id") or "")
+            account["display_name"] = clean_article_text(user.get("name"))
+            account["profile_image_url"] = clean_article_text(
+                user.get("profile_image_url")
+            )
+            if user.get("protected"):
+                note = (
+                    "\nThat account is protected, so its posts are not "
+                    "readable with public API access and no alerts will arrive."
+                )
+
+        if not bot.set_x_account(guild.id, account):
+            await interaction.followup.send(
+                "I couldn't save this server's X watchlist.", ephemeral=True
+            )
+            return
+
+        destination = (
+            f"<#{channel.id}>"
+            if channel is not None
+            else "this server's X alerts channel"
+        )
+        await interaction.followup.send(
+            f"Tracking {describe_x_account(account)}.\n"
+            f"Alerts: {destination}.\n"
+            "The first check only records a baseline, so existing posts are "
+            "not posted; new-post alerts start from the next cycle." + note,
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="remove", description="Stop tracking an X account in this server."
+    )
+    @app_commands.describe(username="The X handle to stop tracking.")
+    async def remove(self, interaction: discord.Interaction, username: str) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if not await bot.require_admin(interaction) or guild is None:
+            return
+        normalized = normalize_x_username(username)
+        if normalized is None:
+            await interaction.response.send_message(
+                "That is not an X handle (1-15 letters, digits, underscores).",
+                ephemeral=True,
+            )
+            return
+        if not bot.drop_x_account(guild.id, normalized):
+            await interaction.response.send_message(
+                f"`@{normalized}` is not tracked in this server. Use "
+                "`/xtrack list` to see what is.",
+                ephemeral=True,
+            )
+            return
+        bot.prune_empty_guild_x_accounts(guild.id)
+        await interaction.response.send_message(
+            f"Stopped tracking `@{normalized}`.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="list", description="List the X accounts this server tracks."
+    )
+    async def list_accounts(self, interaction: discord.Interaction) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Run `/xtrack list` inside a Discord server.", ephemeral=True
+            )
+            return
+        accounts = bot.list_x_accounts(guild.id)
+        if not accounts:
+            await interaction.response.send_message(
+                "This server is not tracking any X accounts yet. An "
+                "administrator can add one with `/xtrack add`.",
+                ephemeral=True,
+            )
+            return
+        last_check = (
+            discord.utils.format_dt(bot.last_x_check_at, style="R")
+            if bot.last_x_check_at is not None
+            else "not yet"
+        )
+        lines = [
+            f"**Tracked X accounts** "
+            f"({len(accounts)}/{MAX_TRACKED_X_ACCOUNTS_PER_GUILD})"
+        ]
+        lines.extend(
+            f"\u2022 {describe_x_account(account)}" for account in accounts[:20]
+        )
+        if len(accounts) > 20:
+            lines.append(f"... and {len(accounts) - 20} more")
+        lines.append(f"**Last X check:** {last_check}")
+        if bot.last_x_error:
+            lines.append(f"**Latest issue:** {bot.last_x_error[:200]}")
+        await interaction.response.send_message(
+            "\n".join(lines)[:1900], ephemeral=True
+        )
+
+    @app_commands.command(
+        name="info", description="Show one tracked X account's settings and status."
+    )
+    @app_commands.describe(username="The tracked X handle.")
+    async def info(self, interaction: discord.Interaction, username: str) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Run `/xtrack info` inside a Discord server.", ephemeral=True
+            )
+            return
+        account = bot.get_x_account(guild.id, username)
+        if account is None:
+            await interaction.response.send_message(
+                f"`{username}` is not tracked in this server. Use "
+                "`/xtrack list` to see what is.",
+                ephemeral=True,
+            )
+            return
+        last_success = (
+            discord.utils.format_dt(
+                datetime.fromtimestamp(
+                    account["last_success_ts"], tz=timezone.utc
+                ),
+                style="R",
+            )
+            if account.get("last_success_ts")
+            else "never"
+        )
+        includes = ", ".join(account.get("include_keywords") or []) or "(any post)"
+        excludes = ", ".join(account.get("exclude_keywords") or []) or "(none)"
+        channel = (
+            f"<#{account['channel_id']}>"
+            if account.get("channel_id")
+            else "server default"
+        )
+        lines = [
+            f"**@{account['username']}**"
+            + (f" — {account['label']}" if account.get("label") else ""),
+            f"**Display name:** {account.get('display_name') or '(unknown)'}",
+            f"**X user id:** {account.get('user_id') or '(not resolved yet)'}",
+            f"**Status:** {'paused' if account.get('paused') else 'active'}",
+            f"**Activity filter:** "
+            f"{X_ACTIVITY_FILTER_LABELS.get(account['activity_filter'], 'all')}",
+            f"**Keywords:** only {includes}; excluding {excludes}",
+            f"**Alert channel:** {channel}",
+            f"**Newest post handled:** {account.get('since_id') or '(none yet)'}",
+            f"**Last successful check:** {last_success}",
+        ]
+        if account.get("last_error"):
+            lines.append(f"**Latest issue:** {account['last_error'][:200]}")
+        await interaction.response.send_message(
+            "\n".join(lines)[:1900], ephemeral=True
+        )
+
+    @app_commands.command(
+        name="pause", description="Pause alerts for one tracked X account."
+    )
+    @app_commands.describe(username="The tracked X handle to pause.")
+    async def pause(self, interaction: discord.Interaction, username: str) -> None:
+        await self._set_paused(interaction, username, True)
+
+    @app_commands.command(
+        name="resume", description="Resume alerts for one paused X account."
+    )
+    @app_commands.describe(username="The tracked X handle to resume.")
+    async def resume(self, interaction: discord.Interaction, username: str) -> None:
+        await self._set_paused(interaction, username, False)
+
+    async def _set_paused(
+        self, interaction: discord.Interaction, username: str, paused: bool
+    ) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if not await bot.require_admin(interaction) or guild is None:
+            return
+        account = bot.get_x_account(guild.id, username)
+        if account is None:
+            await interaction.response.send_message(
+                f"`{username}` is not tracked in this server. Use "
+                "`/xtrack list` to see what is.",
+                ephemeral=True,
+            )
+            return
+        account["paused"] = paused
+        bot.save_x_accounts()
+        verb = "Paused" if paused else "Resumed"
+        await interaction.response.send_message(
+            f"{verb} alerts for {describe_x_account(account)}.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="rename", description="Change the nickname shown for a tracked account."
+    )
+    @app_commands.describe(
+        username="The tracked X handle.",
+        label="The new nickname; pass 'clear' to remove it.",
+    )
+    async def rename(
+        self, interaction: discord.Interaction, username: str, label: str
+    ) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if not await bot.require_admin(interaction) or guild is None:
+            return
+        account = bot.get_x_account(guild.id, username)
+        if account is None:
+            await interaction.response.send_message(
+                f"`{username}` is not tracked in this server. Use "
+                "`/xtrack list` to see what is.",
+                ephemeral=True,
+            )
+            return
+        new_label = "" if self._clear_sentinel(label) else label.strip()
+        account["label"] = new_label[:MAX_X_LABEL_LENGTH]
+        bot.save_x_accounts()
+        await interaction.response.send_message(
+            f"Updated {describe_x_account(account)}.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="settings", description="Change what one tracked account alerts on."
+    )
+    @app_commands.describe(
+        username="The tracked X handle.",
+        channel="New alert channel for this account (optional).",
+        activity="Which activity should generate an alert.",
+        keywords="Comma-separated include keywords; 'clear' removes them.",
+        exclude="Comma-separated exclude keywords; 'clear' removes them.",
+    )
+    @app_commands.choices(
+        activity=[
+            app_commands.Choice(name=X_ACTIVITY_FILTER_LABELS[key], value=key)
+            for key in X_ACTIVITY_FILTERS
+        ]
+    )
+    async def settings(
+        self,
+        interaction: discord.Interaction,
+        username: str,
+        channel: discord.TextChannel | None = None,
+        activity: app_commands.Choice[str] | None = None,
+        keywords: str | None = None,
+        exclude: str | None = None,
+    ) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if not await bot.require_admin(interaction) or guild is None:
+            return
+        account = bot.get_x_account(guild.id, username)
+        if account is None:
+            await interaction.response.send_message(
+                f"`{username}` is not tracked in this server. Use "
+                "`/xtrack list` to see what is.",
+                ephemeral=True,
+            )
+            return
+
+        include = exclude_list = None
+        if keywords is not None:
+            include = [] if self._clear_sentinel(keywords) else (
+                parse_keyword_list(keywords) or []
+            )
+        if exclude is not None:
+            exclude_list = [] if self._clear_sentinel(exclude) else (
+                parse_keyword_list(exclude) or []
+            )
+        apply_x_account_options(
+            account,
+            activity_filter=activity.value if activity is not None else None,
+            include_keywords=include,
+            exclude_keywords=exclude_list,
+            channel=channel,
+        )
+        bot.save_x_accounts()
+
+        destination = (
+            f"<#{account['channel_id']}>"
+            if account.get("channel_id")
+            else "the server's X alerts channel"
+        )
+        await interaction.response.send_message(
+            f"Updated {describe_x_account(account)}.\n"
+            f"Activity: {X_ACTIVITY_FILTER_LABELS.get(account['activity_filter'], 'all')}. "
+            f"Alerts go to {destination}.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="test", description="Send a test X alert to the account's channel."
+    )
+    @app_commands.describe(username="The tracked X handle to test delivery for.")
+    async def test(self, interaction: discord.Interaction, username: str) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Run `/xtrack test` inside a Discord server.", ephemeral=True
+            )
+            return
+        account = bot.get_x_account(guild.id, username)
+        if account is None:
+            await interaction.response.send_message(
+                f"`{username}` is not tracked in this server. Use "
+                "`/xtrack list` to see what is.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        destinations = await bot.get_alert_channels("x")
+        channel = destinations.get(str(guild.id))
+        override_id = account.get("channel_id")
+        if isinstance(override_id, int) and override_id > 0:
+            try:
+                resolved = await bot.resolve_channel(override_id)
+                if resolved.guild.id == guild.id:
+                    channel = resolved
+            except Exception:
+                logger.warning(
+                    "Could not resolve the X test channel %s for @%s.",
+                    override_id,
+                    account["username"],
+                )
+        if channel is None:
+            await interaction.followup.send(
+                "No channel is configured for X alerts in this server. Run "
+                "`/set-x-alerts` (or `/setup`), or give this account its own "
+                "channel with `/xtrack settings`.",
+                ephemeral=True,
+            )
+            return
+        embed = discord.Embed(
+            title=f"Test \u00b7 @{account['username']}",
+            url=f"{X_PROFILE_URL}/{account['username']}",
+            description=(
+                "This is a test notification from the X tracker.\n"
+                f"New posts from this account are polled every "
+                f"{bot.x_poll_interval} seconds and posted here automatically."
+            ),
+            color=SOVEREIGN_COLOR,
+        )
+        if account.get("display_name"):
+            embed.set_author(name=account["display_name"])
+        if await bot.send_embed(channel, embed, str(guild.id)):
+            await interaction.followup.send(
+                f"Test delivered to <#{channel.id}>.", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"Could not deliver to <#{channel.id}>; check the bot's "
+                "permissions (send messages and embed links).",
+                ephemeral=True,
+            )
+
+    @app_commands.command(
+        name="status", description="Show X tracking health and this server's watchlist."
+    )
+    async def status(self, interaction: discord.Interaction) -> None:
+        bot = self.bot
+        guild = interaction.guild
+        token = (
+            "configured"
+            if bot.x_api_bearer
+            else "NOT configured (X_API_BEARER_TOKEN is missing)"
+        )
+        last_check = (
+            discord.utils.format_dt(bot.last_x_check_at, style="R")
+            if bot.last_x_check_at is not None
+            else "not yet"
+        )
+        lines = [
+            "**X tracker status**",
+            f"**API access:** {token}",
+            f"**Polling:** every {bot.x_poll_interval} seconds "
+            "(polling, so delivery is never instantaneous)",
+            f"**Last check:** {last_check}",
+        ]
+        if bot.x_monitor_started_at is not None:
+            lines.append(
+                "**Monitoring started:** "
+                f"{discord.utils.format_dt(bot.x_monitor_started_at, style='R')}"
+            )
+        if bot.last_x_error:
+            lines.append(f"**Latest issue:** {bot.last_x_error[:200]}")
+        lines.append(
+            f"**This process:** {bot.x_posts_seen} post(s) seen, "
+            f"{bot.x_alerts_sent} alert(s) delivered."
+        )
+        if guild is not None:
+            accounts = bot.list_x_accounts(guild.id)
+            paused = sum(1 for account in accounts if account.get("paused"))
+            lines.append(
+                f"**This server:** {len(accounts)} tracked "
+                f"({paused} paused) of "
+                f"{MAX_TRACKED_X_ACCOUNTS_PER_GUILD} allowed."
+            )
+        await interaction.response.send_message(
+            "\n".join(lines)[:1900], ephemeral=True
+        )
+
+
 class LashNewsBot(commands.Bot):
     def __init__(
         self,
@@ -2736,6 +3585,20 @@ class LashNewsBot(commands.Bot):
         self.last_wallet_error: str | None = None
         self.last_wallet_activity_count = 0
         self.wallet_alerts_sent = 0
+        # X/Twitter tracking: the bearer token comes from the hosting
+        # environment; an empty token disables the tracker with a clear
+        # status message instead of failing at request time.
+        self.x_api_bearer = os.getenv("X_API_BEARER_TOKEN", "").strip()
+        self.x_state = load_x_state()
+        self.x_poll_interval = X_POLL_INTERVAL_SECONDS
+        self.x_task: asyncio.Task[None] | None = None
+        self.x_poll_wakeup = asyncio.Event()
+        self.last_x_check_at: datetime | None = None
+        self.last_x_error: str | None = None
+        self.x_monitor_started_at: datetime | None = None
+        self.x_posts_seen = 0
+        self.x_alerts_sent = 0
+        self._x_monitor_running = False
         self.guild_seen_articles = load_guild_seen_articles()
         self.guild_seen_article_urls = {
             guild_id: set(urls)
@@ -2806,6 +3669,7 @@ class LashNewsBot(commands.Bot):
             self.set_new_markets_slash,
             self.set_whale_alerts_slash,
             self.set_wallet_alerts_slash,
+            self.set_x_alerts_slash,
             # Diagnostics and charting.
             self.config_check_slash,
             self.chart_slash,
@@ -2814,6 +3678,9 @@ class LashNewsBot(commands.Bot):
         # bound method: the group binds its own subcommands to itself.
         self.wallet_group = WalletCommands(self)
         self.tree.add_command(self.wallet_group)
+        # /xtrack watches X/Twitter accounts; same group pattern as /wallet.
+        self.xtrack_group = XCommands(self)
+        self.tree.add_command(self.xtrack_group)
         # Route unhandled application-command errors away from the library's
         # silent default so failures are logged and the user gets a reply.
         self.tree.on_error = self.on_app_command_error
@@ -2830,6 +3697,9 @@ class LashNewsBot(commands.Bot):
             self.news_task.cancel()
         self.news_task = asyncio.create_task(
             self.poll_news_forever(), name="lash-news-monitor"
+        )
+        self.x_task = asyncio.create_task(
+            self.poll_x_forever(), name="lash-x-monitor"
         )
 
     def install_signal_handlers(self) -> None:
@@ -2963,17 +3833,19 @@ class LashNewsBot(commands.Bot):
             )
 
     async def close(self) -> None:
-        if self.news_task is not None:
-            self.news_task.cancel()
+        for task in (self.news_task, self.x_task):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self.news_task
+                await task
             except asyncio.CancelledError:
                 pass
             except Exception:
                 # A monitor that already died (or that never reached the gateway)
                 # must not turn a shutdown into a crash.
                 logger.exception(
-                    "The monitoring task ended with an error during shutdown."
+                    "A monitoring task ended with an error during shutdown."
                 )
         if self.news_session is not None:
             await self.news_session.close()
@@ -3939,6 +4811,22 @@ class LashNewsBot(commands.Bot):
         await self.apply_alert_channel(interaction, "wallet", channel)
 
     @app_commands.command(
+        name="set-x-alerts",
+        description="Send X (Twitter) tracker alerts to their own channel.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.describe(
+        channel="Channel for X alerts; empty uses this server's default channel."
+    )
+    async def set_x_alerts_slash(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        await self.apply_alert_channel(interaction, "x", channel)
+
+    @app_commands.command(
         name="config-check",
         description="Check this server's alert channels and report anything broken.",
     )
@@ -4438,11 +5326,14 @@ class LashNewsBot(commands.Bot):
             "\u2022 `/alerts` \u2014 the price-move, large-trade, and new-market "
             "thresholds.\n"
             "\u2022 `/set-news-alerts`, `/set-price-alerts`, `/set-new-markets`, "
-            "`/set-whale-alerts`, `/set-wallet-alerts` \u2014 one category per "
-            "channel.\n"
+            "`/set-whale-alerts`, `/set-wallet-alerts`, `/set-x-alerts` \u2014 "
+            "one category per channel.\n"
             "**Wallet watchlists**\n"
             "\u2022 `/wallet add|remove|list|info|settings|pause|resume` \u2014 track "
             "Polymarket wallets and choose what alerts.\n"
+            "**X (Twitter) tracker**\n"
+            "\u2022 `/xtrack add|remove|list|info|settings|pause|resume|rename|"
+            "test|status` \u2014 watch X accounts and alert on their new posts.\n"
             "**Monitoring**\n"
             "\u2022 `/chart` \u2014 render a market's price history as a PNG.\n"
             "\u2022 `/status` \u2014 per-subsystem health and this server's settings.\n"
@@ -5277,6 +6168,665 @@ class LashNewsBot(commands.Bot):
             alerted,
             failures,
         )
+
+    # ------------------------------------------------------------------
+    # X account watchlists
+    # ------------------------------------------------------------------
+
+    def x_guild_state(self, guild_id: int | str) -> dict[str, Any]:
+        """One server's X watchlist entry, created in memory when absent."""
+        key = str(guild_id)
+        state = self.x_state.get(key)
+        if state is None or not isinstance(state.get("accounts"), dict):
+            state = {"accounts": {}}
+            self.x_state[key] = state
+        return state
+
+    def get_x_account(
+        self, guild_id: int | str, username: str
+    ) -> dict[str, Any] | None:
+        normalized = normalize_x_username(username)
+        if normalized is None:
+            return None
+        return self.x_guild_state(guild_id)["accounts"].get(normalized)
+
+    def list_x_accounts(self, guild_id: int | str) -> list[dict[str, Any]]:
+        accounts = self.x_guild_state(guild_id)["accounts"]
+        return sorted(
+            accounts.values(), key=lambda account: account["username"].casefold()
+        )
+
+    def set_x_account(self, guild_id: int | str, account: dict[str, Any]) -> bool:
+        self.x_guild_state(guild_id)["accounts"][
+            account["username"].casefold()
+        ] = account
+        return self.save_x_accounts()
+
+    def drop_x_account(self, guild_id: int | str, username: str) -> bool:
+        normalized = normalize_x_username(username)
+        if normalized is None:
+            return False
+        return (
+            self.x_guild_state(guild_id)["accounts"].pop(normalized, None)
+            is not None
+        )
+
+    def x_limit_reached(self, guild_id: int | str) -> bool:
+        return (
+            len(self.list_x_accounts(guild_id)) >= MAX_TRACKED_X_ACCOUNTS_PER_GUILD
+        )
+
+    def prune_empty_guild_x_accounts(self, guild_id: int | str) -> None:
+        key = str(guild_id)
+        state = self.x_state.get(key)
+        if state is not None and not state.get("accounts"):
+            self.x_state.pop(key, None)
+
+    def save_x_accounts(self) -> bool:
+        try:
+            save_x_state(self.x_state)
+            return True
+        except OSError:
+            logger.exception("Could not save the X watchlist.")
+            return False
+
+    def tracked_x_accounts_by_user_id(
+        self,
+    ) -> dict[str, dict[str, dict[str, Any]]]:
+        """{user_id: {guild_id: account}} for every resolved tracked account."""
+        by_user: dict[str, dict[str, dict[str, Any]]] = {}
+        for guild_id, state in self.x_state.items():
+            for account in state.get("accounts", {}).values():
+                user_id = account.get("user_id")
+                if not user_id:
+                    continue
+                by_user.setdefault(user_id, {})[guild_id] = account
+        return by_user
+
+    # ------------------------------------------------------------------
+    # X API access (official v2, app-only bearer token)
+    # ------------------------------------------------------------------
+
+    def x_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.x_api_bearer}",
+            "Accept": "application/json",
+            "User-Agent": "LashNewsBot/1.0",
+        }
+
+    @staticmethod
+    def x_http_status(exc: Exception) -> int | None:
+        """The HTTP status embedded in a get_json failure message, if any."""
+        match = re.search(r"\bHTTP (\d{3})\b", str(exc))
+        return int(match.group(1)) if match else None
+
+    def x_api_error_from(self, exc: Exception, subject: str) -> XApiError:
+        """Explain an X API failure in operator terms."""
+        status = self.x_http_status(exc)
+        if status == 404:
+            return XApiError(
+                404,
+                f"@{subject} was not found on X. Check the handle; suspended "
+                "or deleted accounts cannot be tracked.",
+                transient=False,
+            )
+        if status == 401:
+            return XApiError(
+                401,
+                "X rejected the configured API token (HTTP 401). Set a valid "
+                "X_API_BEARER_TOKEN in the hosting environment.",
+                transient=False,
+            )
+        if status == 403:
+            return XApiError(
+                403,
+                f"@{subject} is protected or not readable with the configured "
+                "X API access.",
+                transient=False,
+            )
+        if status == 429:
+            return XApiError(
+                429,
+                "X rate-limited the request; it will be retried next cycle.",
+                transient=True,
+            )
+        if "not found error" in str(exc).casefold():
+            # X sometimes reports a missing user as HTTP 400 with a
+            # "Not Found Error" body; retrying it forever would never help.
+            return XApiError(
+                status,
+                f"@{subject} was not found on X. Check the handle; suspended "
+                "or deleted accounts cannot be tracked.",
+                transient=False,
+            )
+        if status is not None and status >= 500:
+            return XApiError(
+                status,
+                "X is having a temporary problem; it will be retried next cycle.",
+                transient=True,
+            )
+        return XApiError(
+            status, str(exc)[:200] or "Unknown X API error.", transient=True
+        )
+
+    async def fetch_x_user(self, username: str) -> dict[str, Any]:
+        """Resolve a handle to its X user object, or raise XApiError."""
+        try:
+            payload = await self.get_json(
+                f"{X_API_BASE_URL}/users/by/username/{username}",
+                params={"user.fields": "profile_image_url,protected,verified"},
+                headers=self.x_headers(),
+                timeout=15,
+            )
+        except RuntimeError as exc:
+            raise self.x_api_error_from(exc, username) from exc
+        user = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(user, dict) or not str(user.get("id", "")).isdigit():
+            raise XApiError(
+                None, "X returned an unexpected user response.", transient=True
+            )
+        return user
+
+    async def fetch_x_posts(
+        self, user_id: str, since_id: str = ""
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """One page of a user's recent posts plus the expanded includes.
+
+        Returns ``(posts, includes)`` where includes carries the media and
+        referenced-post objects needed to render rich alerts. Only posts newer
+        than ``since_id`` are requested, so a quiet account returns nothing
+        and costs nothing on X's pay-per-use billing.
+        """
+        params: dict[str, str] = {
+            "max_results": str(MAX_X_POSTS_PER_POLL),
+            "tweet.fields": (
+                "created_at,public_metrics,attachments,referenced_tweets"
+            ),
+            "expansions": (
+                "attachments.media_keys,referenced_tweets.id,"
+                "referenced_tweets.id.author_id"
+            ),
+            "media.fields": "url,preview_image_url,type",
+            "user.fields": "profile_image_url,name,username",
+        }
+        if since_id:
+            params["since_id"] = since_id
+        try:
+            payload = await self.get_json(
+                f"{X_API_BASE_URL}/users/{user_id}/tweets",
+                params=params,
+                headers=self.x_headers(),
+                timeout=15,
+            )
+        except RuntimeError as exc:
+            raise self.x_api_error_from(exc, f"id:{user_id}") from exc
+        if not isinstance(payload, dict):
+            raise XApiError(
+                None, "X returned an unexpected timeline response.", transient=True
+            )
+        posts = payload.get("data")
+        if posts is None:
+            # An empty timeline answer: no "data" key at all.
+            includes = payload.get("includes")
+            return [], includes if isinstance(includes, dict) else {}
+        if not isinstance(posts, list):
+            raise XApiError(
+                None, "X returned an unexpected timeline response.", transient=True
+            )
+        includes = payload.get("includes")
+        return (
+            [post for post in posts if isinstance(post, dict)],
+            includes if isinstance(includes, dict) else {},
+        )
+
+    async def resolve_x_account(self, account: dict[str, Any]) -> bool:
+        """Ensure one account has a resolved user id; False when it cannot."""
+        if account.get("user_id"):
+            return True
+        try:
+            user = await self.fetch_x_user(account["username"])
+        except XApiError as exc:
+            account["last_error"] = str(exc)[:200]
+            if not exc.transient:
+                logger.warning(
+                    "X account @%s cannot be resolved: %s",
+                    account["username"],
+                    exc,
+                )
+            return False
+        account["user_id"] = str(user.get("id") or "")
+        account["display_name"] = clean_article_text(user.get("name"))
+        account["profile_image_url"] = clean_article_text(
+            user.get("profile_image_url")
+        )
+        account["last_error"] = ""
+        return bool(account["user_id"])
+
+    # ------------------------------------------------------------------
+    # The X monitoring cycle
+    # ------------------------------------------------------------------
+
+    async def poll_x_forever(self) -> None:
+        """The X monitoring task: poll until cancelled or the bot closes."""
+        if self._x_monitor_running:
+            logger.warning(
+                "The X monitoring loop is already running; not starting a "
+                "second one."
+            )
+            return
+        self._x_monitor_running = True
+        try:
+            await self.wait_until_ready()
+            self.x_monitor_started_at = datetime.now(timezone.utc)
+            if not self.x_api_bearer:
+                logger.warning(
+                    "X tracking is disabled: X_API_BEARER_TOKEN is not set in "
+                    "the hosting environment. Set it and restart to enable "
+                    "X account alerts."
+                )
+                self.last_x_error = (
+                    "X_API_BEARER_TOKEN is not set; X tracking is disabled."
+                )
+                return
+            logger.info(
+                "X tracking started; polling every %d seconds.",
+                self.x_poll_interval,
+            )
+            await self._x_monitor_loop()
+        except asyncio.CancelledError:
+            logger.info("X monitoring stopped.")
+            raise
+        finally:
+            self._x_monitor_running = False
+
+    async def _x_monitor_loop(self) -> None:
+        retry_attempt = 0
+        while not self.is_closed():
+            try:
+                await self.run_x_cycle()
+                retry_attempt = 0
+                delay = self.x_poll_interval
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                retry_attempt += 1
+                self.last_x_error = str(exc)[:300] or "Unknown X polling error."
+                backoff = 30 * (2 ** min(retry_attempt - 1, 6))
+                delay = min(self.x_poll_interval, backoff)
+                logger.exception(
+                    "X check failed; retrying in %d seconds (failure %d).",
+                    delay,
+                    retry_attempt,
+                )
+            try:
+                await asyncio.wait_for(self.x_poll_wakeup.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                self.x_poll_wakeup.clear()
+
+    async def run_x_cycle(self) -> None:
+        """Poll every tracked X account once and deliver the new posts.
+
+        Each distinct user id is fetched once per cycle however many servers
+        track it, using the newest since_id across those servers, so one
+        account never costs more than one timeline request per cycle. Every
+        server still applies its own filters, dedupe history, and channel.
+        """
+        if not self.x_api_bearer:
+            self.last_x_check_at = datetime.now(timezone.utc)
+            self.last_x_error = (
+                "X_API_BEARER_TOKEN is not set; X tracking is disabled. "
+                "Set it in the hosting environment and restart."
+            )
+            return
+
+        try:
+            destinations = await self.get_alert_channels("x")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Could not resolve the X alert channels this cycle.")
+            destinations = {}
+
+        accounts_by_guild: dict[str, list[dict[str, Any]]] = {}
+        for guild_id, channel in destinations.items():
+            if channel is None:
+                continue
+            if not self.get_settings(guild_id)["alerts"].get("x", True):
+                continue
+            active = [
+                account
+                for account in self.list_x_accounts(guild_id)
+                if not account.get("paused")
+            ]
+            if active:
+                accounts_by_guild[guild_id] = active
+
+        # An account with its own channel override is polled even when its
+        # server has no default X alerts channel configured.
+        for guild_id in list(self.x_state.keys()):
+            if guild_id in accounts_by_guild:
+                continue
+            if not self.get_settings(guild_id)["alerts"].get("x", True):
+                continue
+            override_accounts = [
+                account
+                for account in self.list_x_accounts(guild_id)
+                if not account.get("paused") and account.get("channel_id")
+            ]
+            if override_accounts:
+                accounts_by_guild[guild_id] = override_accounts
+
+        if not accounts_by_guild:
+            self.last_x_check_at = datetime.now(timezone.utc)
+            self.last_x_error = None
+            return
+
+        # Resolve any handle that has not been mapped to a user id yet.
+        for guild_accounts in accounts_by_guild.values():
+            for account in guild_accounts:
+                if not account.get("user_id"):
+                    await self.resolve_x_account(account)
+
+        poll_targets: dict[str, dict[str, dict[str, Any]]] = {}
+        for user_id, guild_map in self.tracked_x_accounts_by_user_id().items():
+            eligible = {
+                guild_id: account
+                for guild_id, account in guild_map.items()
+                if guild_id in accounts_by_guild
+            }
+            if eligible:
+                poll_targets[user_id] = eligible
+
+        if not poll_targets:
+            self.last_x_check_at = datetime.now(timezone.utc)
+            self.last_x_error = None
+            return
+
+        if len(poll_targets) > MAX_X_ACCOUNTS_PER_CYCLE:
+            logger.warning(
+                "The X watchlist has %d distinct accounts; only the first %d "
+                "are polled this cycle.",
+                len(poll_targets),
+                MAX_X_ACCOUNTS_PER_CYCLE,
+            )
+            poll_targets = dict(
+                sorted(poll_targets.items())[:MAX_X_ACCOUNTS_PER_CYCLE]
+            )
+
+        failures = 0
+        posts_seen = 0
+        alerted = 0
+        posted_by_guild: dict[str, int] = {}
+        for user_id, guild_map in poll_targets.items():
+            best_since = ""
+            for account in guild_map.values():
+                since = account.get("since_id") or ""
+                if since and (not best_since or int(since) > int(best_since)):
+                    best_since = since
+            try:
+                posts, includes = await self.fetch_x_posts(user_id, best_since)
+            except XApiError as exc:
+                failures += 1
+                for account in guild_map.values():
+                    account["last_error"] = str(exc)[:200]
+                logger.warning(
+                    "X timeline lookup failed for user %s: %s", user_id, exc
+                )
+                continue
+
+            posts_seen += len(posts)
+            newest_id = ""
+            for post in posts:
+                post_id = str(post.get("id") or "")
+                if post_id.isdigit() and (
+                    not newest_id or int(post_id) > int(newest_id)
+                ):
+                    newest_id = post_id
+            # Newest first, so a burst arrives in reading order.
+            ordered = sorted(
+                posts,
+                key=lambda post: int(str(post.get("id") or "0")),
+                reverse=True,
+            )
+
+            for guild_id, account in guild_map.items():
+                since = account.get("since_id") or ""
+                if not since:
+                    # First poll of this account for this server: record a
+                    # baseline of the newest post so its existing history is
+                    # never dumped into the channel.
+                    if newest_id:
+                        account["since_id"] = newest_id
+                    if newest_id:
+                        account["last_success_ts"] = (
+                            datetime.now(timezone.utc).timestamp()
+                        )
+                    continue
+                seen = list(dict.fromkeys(str(v) for v in account.get("seen") or []))
+                seen_set = set(seen)
+                delivered = 0
+                # If anything could not be delivered, the high-water mark must
+                # not advance past it or that post would be skipped forever.
+                undelivered = False
+                for post in ordered:
+                    post_id = str(post.get("id") or "")
+                    if not post_id or not x_post_is_newer(post_id, since):
+                        continue
+                    if post_id in seen_set:
+                        continue
+                    activity = x_post_activity(post)
+                    if not x_post_passes_filters(account, post, activity):
+                        # Remember it anyway, so changing filters later does
+                        # not replay old posts.
+                        seen_set.add(post_id)
+                        seen.append(post_id)
+                        continue
+                    if delivered >= MAX_X_ALERTS_PER_CYCLE or (
+                        posted_by_guild.get(guild_id, 0)
+                        >= MAX_X_ALERTS_PER_CYCLE
+                    ):
+                        undelivered = True
+                        break
+                    channel = destinations.get(guild_id)
+                    override_id = account.get("channel_id")
+                    if isinstance(override_id, int) and override_id > 0:
+                        try:
+                            resolved = await self.resolve_channel(override_id)
+                        except Exception:
+                            logger.warning(
+                                "Could not resolve the X alert channel %s for "
+                                "@%s; using the server's X channel.",
+                                override_id,
+                                account["username"],
+                            )
+                        else:
+                            if str(resolved.guild.id) == guild_id:
+                                channel = resolved
+                    if channel is None:
+                        undelivered = True
+                        break
+                    embed = self.make_x_embed(post, account, activity, includes)
+                    if await self.send_embed(channel, embed, guild_id):
+                        delivered += 1
+                        alerted += 1
+                        self.x_alerts_sent += 1
+                        posted_by_guild[guild_id] = (
+                            posted_by_guild.get(guild_id, 0) + 1
+                        )
+                        seen_set.add(post_id)
+                        seen.append(post_id)
+                    else:
+                        undelivered = True
+                        break
+                account["seen"] = seen[-MAX_X_SEEN_POSTS:]
+                if not undelivered and newest_id and (
+                    not since or int(newest_id) > int(since)
+                ):
+                    account["since_id"] = newest_id
+                if delivered or newest_id:
+                    account["last_success_ts"] = (
+                        datetime.now(timezone.utc).timestamp()
+                    )
+                if not failures:
+                    account["last_error"] = ""
+
+        self.save_x_accounts()
+        self.x_posts_seen = posts_seen
+        self.last_x_check_at = datetime.now(timezone.utc)
+        self.last_x_error = (
+            f"{failures} of {len(poll_targets)} X lookups failed"
+            if failures
+            else None
+        )
+        logger.info(
+            "X check complete: %d account(s) polled, %d post(s) seen, "
+            "%d alert(s) posted, %d lookup failure(s).",
+            len(poll_targets),
+            posts_seen,
+            alerted,
+            failures,
+        )
+
+    def make_x_embed(
+        self,
+        post: dict[str, Any],
+        account: dict[str, Any],
+        activity: str,
+        includes: dict[str, Any],
+    ) -> discord.Embed:
+        """Build the alert embed for one detected post."""
+        username = account["username"]
+        display = account.get("display_name") or username
+        label = clean_article_text(account.get("label"))
+        post_id = str(post.get("id") or "")
+        url = f"{X_PROFILE_URL}/{username}/status/{post_id}"
+
+        label_text = X_ACTIVITY_TYPE_LABELS.get(activity, "New post")
+        embed = discord.Embed(
+            title=f"{label_text} \u00b7 @{username}",
+            url=url,
+            description=clean_article_text(post.get("text"))[:4000] or None,
+            color=SOVEREIGN_COLOR,
+        )
+        embed.set_author(
+            name=f"{display} (@{username})" + (f" \u2014 {label}" if label else ""),
+            url=f"{X_PROFILE_URL}/{username}",
+            icon_url=account.get("profile_image_url") or None,
+        )
+
+        created = parse_published_at(post.get("created_at"))
+        if created is not None:
+            embed.timestamp = created
+
+        # Media: the first photo is attached as the embed image; anything
+        # else (videos, extra photos) is linked so nothing is silently lost.
+        media_urls: list[str] = []
+        media_by_key = {
+            item.get("media_key"): item
+            for item in includes.get("media", [])
+            if isinstance(item, dict)
+        }
+        attachments = post.get("attachments")
+        media_keys = (
+            attachments.get("media_keys") if isinstance(attachments, dict) else None
+        ) or []
+        for key in media_keys:
+            item = media_by_key.get(key)
+            if not isinstance(item, dict):
+                continue
+            media_url = item.get("url") or item.get("preview_image_url")
+            if not media_url:
+                continue
+            if item.get("type") in ("photo", "animated_gif") and not (
+                embed.image and embed.image.url
+            ):
+                embed.set_image(url=str(media_url))
+            else:
+                media_urls.append(str(media_url))
+        if media_urls:
+            embed.add_field(
+                name="Media",
+                value="\n".join(f"[Attachment]({link})" for link in media_urls[:4]),
+                inline=False,
+            )
+
+        # The referenced post for quotes/reposts, or the parent for replies.
+        refs = post.get("referenced_tweets")
+        ref_ids = {
+            str(ref.get("id"))
+            for ref in refs
+            if isinstance(ref, dict) and ref.get("id")
+        } if isinstance(refs, list) else set()
+        users_by_id = {
+            str(user.get("id")): user
+            for user in includes.get("users", [])
+            if isinstance(user, dict)
+        }
+        for ref_post in includes.get("tweets", []):
+            if (
+                not isinstance(ref_post, dict)
+                or str(ref_post.get("id")) not in ref_ids
+            ):
+                continue
+            ref_author = users_by_id.get(str(ref_post.get("author_id")))
+            ref_handle = (
+                ref_author.get("username")
+                if isinstance(ref_author, dict)
+                else None
+            )
+            ref_name = f"@{ref_handle}" if ref_handle else "an earlier post"
+            ref_text = clean_article_text(ref_post.get("text"))[:700]
+            if activity == "quote":
+                field_name = "Quoted post"
+            elif activity == "repost":
+                field_name = "Reposted post"
+            else:
+                field_name = "Replying to"
+            embed.add_field(
+                name=field_name,
+                value=f"{ref_name}: {ref_text}" if ref_text else ref_name,
+                inline=False,
+            )
+            break
+
+        metrics = post.get("public_metrics")
+        if isinstance(metrics, dict):
+            parts = []
+            for key, noun in (
+                ("like_count", "likes"),
+                ("retweet_count", "reposts"),
+                ("reply_count", "replies"),
+                ("quote_count", "quotes"),
+            ):
+                count = metrics.get(key)
+                if isinstance(count, int) and count:
+                    parts.append(f"{count:,} {noun}")
+            if parts:
+                embed.set_footer(text=" \u00b7 ".join(parts))
+
+        # Optional Polymarket convenience: offer market-search links for the
+        # tokens this post names. This is a search shortcut, not a claim that
+        # the post affects any market's outcome or price.
+        post_text = clean_article_text(post.get("text"))
+        symbols = x_cashtag_symbols(post_text)
+        if symbols:
+            links = " ".join(
+                f"[${symbol}](https://polymarket.com/search?_q="
+                f"{quote(symbol)})"
+                for symbol in symbols
+            )
+            embed.add_field(
+                name="Polymarket", value=f"Search markets: {links}", inline=False
+            )
+        elif "polymarket" in post_text.casefold():
+            embed.add_field(
+                name="Polymarket",
+                value="[Browse markets](https://polymarket.com/markets)",
+                inline=False,
+            )
+        return embed
 
     def whale_alert_is_duplicate(self, guild_id: str, wallet: Any) -> bool:
         """True when this server already gets a wallet alert for the same fill.

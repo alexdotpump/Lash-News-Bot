@@ -24,9 +24,11 @@ EXPECTED_COMMANDS = {
     "servers", "server-info", "sync",
     # Per-category channel configuration.
     "set-news-alerts", "set-price-alerts", "set-new-markets", "set-whale-alerts",
-    "set-wallet-alerts",
+    "set-wallet-alerts", "set-x-alerts",
     # Wallet watchlists (a command group with subcommands).
     "wallet",
+    # X/Twitter tracker (a command group with subcommands).
+    "xtrack",
     # Diagnostics and charting.
     "config-check", "chart",
 }
@@ -35,17 +37,23 @@ GUILD_ONLY = {
     "setup", "alerts", "status", "test", "sources", "keywords",
     "sync", "server-info",
     "set-news-alerts", "set-price-alerts", "set-new-markets", "set-whale-alerts",
-    "set-wallet-alerts", "wallet",
+    "set-wallet-alerts", "set-x-alerts", "wallet", "xtrack",
     "config-check", "chart",
 }
 # Commands that only server administrators may run by default.
 ADMIN_ONLY = {
     "setup", "alerts", "sources", "keywords",
     "set-news-alerts", "set-price-alerts", "set-new-markets", "set-whale-alerts",
-    "set-wallet-alerts",
+    "set-wallet-alerts", "set-x-alerts",
 }
 # Every registered top-level command that is a group, with its subcommands.
-EXPECTED_GROUPS = {"wallet": {"add", "remove", "list", "info", "settings", "pause", "resume"}}
+EXPECTED_GROUPS = {
+    "wallet": {"add", "remove", "list", "info", "settings", "pause", "resume"},
+    "xtrack": {
+        "add", "remove", "list", "info", "pause", "resume", "rename",
+        "settings", "test", "status",
+    },
+}
 
 
 class FakeResponse:

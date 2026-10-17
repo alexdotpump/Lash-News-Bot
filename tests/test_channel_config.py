@@ -178,10 +178,11 @@ class SettingsSchemaTests(ChannelConfigTestCase):
                 }
             }
         )
-        self.assertEqual(
-            normalized["channels"],
-            {"news": 111, "whale": 222, "price": 333, "new_market": 444, "wallet": None},
+        expected = {alert: None for alert in main.ALERT_TYPES}
+        expected.update(
+            {"news": 111, "whale": 222, "price": 333, "new_market": 444}
         )
+        self.assertEqual(normalized["channels"], expected)
 
     def test_normalize_rejects_garbage_category_channels(self):
         normalized = main.normalize_guild_settings(
