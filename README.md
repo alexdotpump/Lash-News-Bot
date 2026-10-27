@@ -1,4 +1,4 @@
-# Lash News Bot
+# Sovereign bot
 
 Lash News Bot watches Polymarket markets and posts relevant alerts to independently
 configured Discord servers. It covers four alert types: market-moving news, sharp odds
